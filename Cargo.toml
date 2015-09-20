@@ -23,6 +23,7 @@ fnv = "1.0"
 string_cache = "0.1.10"
 string_cache_plugin = { version = "0.1.6", optional = true }
 quickersort = "1.0.0"
+time = "*"
 
 [dev-dependencies]
 rand = "0.3"

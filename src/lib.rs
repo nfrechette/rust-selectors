@@ -17,6 +17,7 @@ extern crate fnv;
 
 pub mod bloom;
 pub mod matching;
+pub mod matching_nfa;
 pub mod parser;
 mod tree;
 
@@ -24,7 +25,7 @@ pub use tree::Element;
 
 
 #[cfg(feature = "unstable")]
-mod hash_map {
+pub mod hash_map {
     use std::collections::hash_state::DefaultState;
     use std::hash::Hash;
 
@@ -36,7 +37,7 @@ mod hash_map {
 }
 
 #[cfg(not(feature = "unstable"))]
-mod hash_map {
+pub mod hash_map {
     use std::hash::Hash;
 
     // Default state: Random SipHasher

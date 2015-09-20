@@ -2,6 +2,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+extern crate time as stdtime;
+
 use std::ascii::AsciiExt;
 use std::cmp::Ordering;
 use std::sync::Arc;
@@ -52,6 +54,21 @@ pub struct SelectorMap<T> {
     empty: bool,
 }
 
+//use std::hash::{Hash, Hasher, SipHasher};
+
+pub struct DebugInfo {
+    pub rules_elapsed_ns: usize,
+    pub num_rules_tested: usize,
+    pub num_rules_matched: usize,
+
+    pub selectors_elapsed_ns: usize,
+    pub num_selectors_tested: usize,
+    pub num_selectors_matched: usize,
+
+    pub per_type_tested: HashMap<u64, usize>,
+    pub per_type_matched: HashMap<u64, usize>,
+}
+
 impl<T> SelectorMap<T> {
     pub fn new() -> SelectorMap<T> {
         SelectorMap {
@@ -72,12 +89,15 @@ impl<T> SelectorMap<T> {
                                        element: &E,
                                        parent_bf: Option<&BloomFilter>,
                                        matching_rules_list: &mut V,
-                                       shareable: &mut bool)
+                                       shareable: &mut bool,
+                                       debug_info: &mut DebugInfo)
                                        where E: Element,
                                              V: VecLike<DeclarationBlock<T>> {
         if self.empty {
             return
         }
+
+        let st = stdtime::precise_time_ns();
 
         // At the end, we're going to sort the rules that we added, so remember where we began.
         let init_len = matching_rules_list.len();
@@ -87,7 +107,8 @@ impl<T> SelectorMap<T> {
                                                       &self.id_hash,
                                                       &id,
                                                       matching_rules_list,
-                                                      shareable)
+                                                      shareable,
+                                                      debug_info)
         }
 
         element.each_class(|class| {
@@ -96,7 +117,8 @@ impl<T> SelectorMap<T> {
                                                       &self.class_hash,
                                                       class,
                                                       matching_rules_list,
-                                                      shareable);
+                                                      shareable,
+                                                      debug_info);
         });
 
         let local_name_hash = if element.is_html_element_in_html_document() {
@@ -109,16 +131,22 @@ impl<T> SelectorMap<T> {
                                                   local_name_hash,
                                                   element.get_local_name(),
                                                   matching_rules_list,
-                                                  shareable);
+                                                  shareable,
+                                                  debug_info);
 
         SelectorMap::get_matching_rules(element,
                                         parent_bf,
                                         &self.universal_rules,
                                         matching_rules_list,
-                                        shareable);
+                                        shareable,
+                                        debug_info);
 
         // Sort only the rules we just added.
         sort_by(&mut matching_rules_list[init_len..], &compare);
+
+        let et = stdtime::precise_time_ns();
+        let elapsed = (et - st) as usize;
+        debug_info.rules_elapsed_ns += elapsed;
 
         fn compare<T>(a: &DeclarationBlock<T>, b: &DeclarationBlock<T>) -> Ordering {
             (a.specificity, a.source_order).cmp(&(b.specificity, b.source_order))
@@ -130,7 +158,8 @@ impl<T> SelectorMap<T> {
                                          hash: &HashMap<Atom, Vec<Rule<T>>>,
                                          key: &Atom,
                                          matching_rules: &mut V,
-                                         shareable: &mut bool)
+                                         shareable: &mut bool,
+                                         debug_info: &mut DebugInfo)
                                          where E: Element,
                                                V: VecLike<DeclarationBlock<T>> {
         match hash.get(key) {
@@ -139,7 +168,8 @@ impl<T> SelectorMap<T> {
                                                 parent_bf,
                                                 rules,
                                                 matching_rules,
-                                                shareable)
+                                                shareable,
+                                                debug_info)
             }
             None => {}
         }
@@ -150,13 +180,22 @@ impl<T> SelectorMap<T> {
                                parent_bf: Option<&BloomFilter>,
                                rules: &[Rule<T>],
                                matching_rules: &mut V,
-                               shareable: &mut bool)
+                               shareable: &mut bool,
+                               debug_info: &mut DebugInfo)
                                where E: Element,
                                      V: VecLike<DeclarationBlock<T>> {
         for rule in rules.iter() {
-            if matches_compound_selector(&*rule.selector, element, parent_bf, shareable) {
+            //let st = stdtime::precise_time_ns();
+            debug_info.num_rules_tested += 1;
+
+            if matches_compound_selector(&*rule.selector, element, parent_bf, shareable, debug_info) {
+                debug_info.num_rules_matched += 1;
                 matching_rules.push(rule.declarations.clone());
             }
+
+            //let et = stdtime::precise_time_ns();
+            //let elapsed = (et - st) as usize;
+            //debug_info.rules_elapsed_ns += elapsed;
         }
     }
 
@@ -288,9 +327,19 @@ pub fn matches<E>(selector_list: &Vec<Selector>,
                   parent_bf: Option<&BloomFilter>)
                   -> bool
                   where E: Element {
+    let mut debug_info = DebugInfo {
+        rules_elapsed_ns: 0,
+        num_rules_tested: 0,
+        num_rules_matched: 0,
+        selectors_elapsed_ns: 0,
+        num_selectors_tested: 0,
+        num_selectors_matched: 0,
+        per_type_tested: hash_map::new(),
+        per_type_matched: hash_map::new(),
+    };
     selector_list.iter().any(|selector| {
         selector.pseudo_element.is_none() &&
-        matches_compound_selector(&*selector.compound_selectors, element, parent_bf, &mut false)
+        matches_compound_selector(&*selector.compound_selectors, element, parent_bf, &mut false, &mut debug_info)
     })
 }
 
@@ -300,16 +349,27 @@ pub fn matches<E>(selector_list: &Vec<Selector>,
 /// `shareable` to false unless you are willing to update the style sharing logic. Otherwise things
 /// will almost certainly break as elements will start mistakenly sharing styles. (See the code in
 /// `main/css/matching.rs`.)
+
+use matching_nfa as nfa;
+
 fn matches_compound_selector<E>(selector: &CompoundSelector,
                                 element: &E,
                                 parent_bf: Option<&BloomFilter>,
-                                shareable: &mut bool)
+                                shareable: &mut bool,
+                                debug_info: &mut DebugInfo)
                                 -> bool
                                 where E: Element {
-    match matches_compound_selector_internal(selector, element, parent_bf, shareable) {
+    let result = match matches_compound_selector_internal(selector, element, parent_bf, shareable, debug_info) {
         SelectorMatchingResult::Matched => true,
         _ => false
+    };
+    let result_nfa = nfa::matches_nfa(selector, element, shareable, debug_info);
+    if result != result_nfa {
+        println!("Ref/NFA: {}/{}", result, result_nfa);
+        panic!();
     }
+    result
+    //result_nfa
 }
 
 /// A result of selector matching, includes 3 failure types,
@@ -368,11 +428,12 @@ enum SelectorMatchingResult {
 fn can_fast_reject<E>(mut selector: &CompoundSelector,
                       element: &E,
                       parent_bf: Option<&BloomFilter>,
-                      shareable: &mut bool)
+                      shareable: &mut bool,
+                      debug_info: &mut DebugInfo)
                       -> Option<SelectorMatchingResult>
                       where E: Element {
     if !selector.simple_selectors.iter().all(|simple_selector| {
-      matches_simple_selector(simple_selector, element, shareable) }) {
+      matches_simple_selector(simple_selector, element, shareable, debug_info) }) {
         return Some(SelectorMatchingResult::NotMatchedAndRestartFromClosestLaterSibling);
     }
 
@@ -429,10 +490,11 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
 fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
                                          element: &E,
                                          parent_bf: Option<&BloomFilter>,
-                                         shareable: &mut bool)
+                                         shareable: &mut bool,
+                                         debug_info: &mut DebugInfo)
                                          -> SelectorMatchingResult
                                          where E: Element {
-    if let Some(result) = can_fast_reject(selector, element, parent_bf, shareable) {
+    if let Some(result) = can_fast_reject(selector, element, parent_bf, shareable, debug_info) {
         return result;
     }
 
@@ -458,7 +520,8 @@ fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
                 let result = matches_compound_selector_internal(&**next_selector,
                                                                 &element,
                                                                 parent_bf,
-                                                                shareable);
+                                                                shareable,
+                                                                debug_info);
                 match (result, combinator) {
                     // Return the status immediately.
                     (SelectorMatchingResult::Matched, _) => return result,
@@ -558,10 +621,18 @@ pub fn rare_style_affecting_attributes() -> [Atom; 3] {
 #[inline]
 pub fn matches_simple_selector<E>(selector: &SimpleSelector,
                                   element: &E,
-                                  shareable: &mut bool)
+                                  shareable: &mut bool,
+                                  debug_info: &mut DebugInfo)
                                   -> bool
                                   where E: Element {
-    match *selector {
+    debug_info.num_selectors_tested += 1;
+    //let mut hasher = SipHasher::new();
+    //selector.hash(&mut hasher);
+    //let selector_hash = hasher.finish();
+    //*debug_info.per_type_tested.entry(selector_hash).or_insert(0) += 1;
+    let st = stdtime::precise_time_ns();
+
+    let is_matched = match *selector {
         SimpleSelector::LocalName(LocalName { ref name, ref lower_name }) => {
             let name = if element.is_html_element_in_html_document() { lower_name } else { name };
             element.get_local_name() == name
@@ -751,9 +822,19 @@ pub fn matches_simple_selector<E>(selector: &SimpleSelector,
 
         SimpleSelector::Negation(ref negated) => {
             *shareable = false;
-            !negated.iter().all(|s| matches_simple_selector(s, element, shareable))
+            !negated.iter().all(|s| matches_simple_selector(s, element, shareable, debug_info))
         },
+    };
+
+    let et = stdtime::precise_time_ns();
+    let elapsed = (et - st) as usize;
+    debug_info.selectors_elapsed_ns += elapsed;
+    if is_matched {
+        debug_info.num_selectors_matched += 1;
+        //*debug_info.per_type_matched.entry(selector_hash).or_insert(0) += 1;
     }
+
+    is_matched
 }
 
 #[inline]
