@@ -113,7 +113,8 @@ enum Symbol {
 }
 
 struct SelectorNFA<'a> {
-    transition_map: HashMap<(&'a State<'a>, Symbol), Vec<&'a State<'a>>>,
+    state_list: Vec<State<'a>>,
+    transition_map: HashMap<(u32, Symbol), Vec<u32>>,
 }
 
 fn get_states_internal<'a, 'b>(selector: &'a CompoundSelector,
@@ -151,62 +152,69 @@ fn get_states<'a>(selector: &'a CompoundSelector) -> Vec<State<'a>> {
     return state_list;
 }
 
-fn get_next_state<'a>(idx: usize, state_list: &'a Vec<State>) -> &'a State<'a> {
+fn get_next_state_idx<'a>(idx: usize, state_list: &'a Vec<State>) -> u32 {
     if idx + 1 >= state_list.len() {
-        return &state_list[0];  // Index 0 is Matched
+        return 0;  // Index 0 is Matched
     }
     else {
-        return &state_list[idx + 1];
+        return idx as u32 + 1;
     }
 }
 
-fn build_transition_map<'a, 'b>(state_list: &'a Vec<State<'a>>,
-                        map: &'b mut HashMap<(&'a State<'a>, Symbol), Vec<&'a State<'a>>>) {
+fn build_transition_map<'a>(state_list: &'a Vec<State<'a>>)
+                            -> HashMap<(u32, Symbol), Vec<u32>> {
 
-    let ref failed = state_list[1]; // Index 1 is Failed
+    let mut map = HashMap::new();
 
-    for idx in 0 .. state_list.len() {
-        let ref state = state_list[idx];
-        let next_state = get_next_state(idx, state_list);
+    let failed_idx: u32 = 1; // Index 1 is Failed
+
+    for state_idx in 0 .. state_list.len() {
+        let ref state = state_list[state_idx];
+        let next_state_idx = get_next_state_idx(state_idx, state_list);
+        let state_idx: u32 = state_idx as u32;
 
         match state {
             &State::Leaf(..) => {
-                map.insert((state, Symbol::Matched), vec![next_state]);
-                map.insert((state, Symbol::NotMatched), vec![failed]);
+                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                map.insert((state_idx, Symbol::NotMatched), vec![failed_idx]);
             }
             &State::Child(..) => {
-                map.insert((state, Symbol::Matched), vec![next_state]);
-                map.insert((state, Symbol::Epsilon), vec![state]);
-                map.insert((state, Symbol::EndOfStream), vec![failed]);
+                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::Descendant(..) => {
-                map.insert((state, Symbol::Matched), vec![next_state, state]);
-                map.insert((state, Symbol::NotMatched), vec![state]);
-                map.insert((state, Symbol::Epsilon), vec![state]);
-                map.insert((state, Symbol::EndOfStream), vec![failed]);
+                map.insert((state_idx, Symbol::Matched), vec![next_state_idx, state_idx]);
+                map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
+                map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::NextSibling(..) => {
-                map.insert((state, Symbol::Matched), vec![next_state]);
+                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
             }
             &State::LaterSibling(..) => {
-                map.insert((state, Symbol::Matched), vec![next_state, state]);
-                map.insert((state, Symbol::NotMatched), vec![state]);
+                map.insert((state_idx, Symbol::Matched), vec![next_state_idx, state_idx]);
+                map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
                 // TODO: Prune matched epsilon transition in special cases
             }
             &State::Matched => {}
             &State::Failed => {}
         }
     }
+
+    return map;
 }
 
-fn build_nfa<'a>(state_list: &'a Vec<State<'a>>) -> SelectorNFA {
-    let mut nfa = SelectorNFA {
-        transition_map: HashMap::new(),
+fn build_nfa<'a>(selector: &'a CompoundSelector) -> SelectorNFA {
+
+    let state_list = get_states(selector);
+
+    let map = build_transition_map(&state_list);
+
+    return SelectorNFA {
+        state_list: state_list,
+        transition_map: map,
     };
-
-    build_transition_map(state_list, &mut nfa.transition_map);
-
-    return nfa;
 }
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
@@ -292,10 +300,12 @@ fn get_symbol<'a, E>(state: &'a State, input_value: InputValue,
     }
 }
 
-fn accepts<'a, E>(state: &'a State, nfa: &'a SelectorNFA,
+fn accepts<'a, E>(state_idx: u32, nfa: &'a SelectorNFA,
                   input_value: InputValue, element: &'a E,
                   shareable: &mut bool, debug_info: &mut DebugInfo)
                   -> bool where E: Element {
+    let ref state = nfa.state_list[state_idx as usize];
+
     match state {
         &State::Matched => return true,
         &State::Failed => return false,
@@ -309,7 +319,7 @@ fn accepts<'a, E>(state: &'a State, nfa: &'a SelectorNFA,
         return false;
     }
 
-    let transitions = nfa.transition_map.get(&(state, symbol));
+    let transitions = nfa.transition_map.get(&(state_idx, symbol));
 
     match transitions {
         None => {},
@@ -353,14 +363,12 @@ pub fn matches_nfa<E>(selector: &CompoundSelector,
                       -> bool
                       where E: Element {
 
-    let state_list = get_states(selector);
-
-    let nfa = build_nfa(&state_list);
+    let nfa = build_nfa(selector);
 
     *shareable = false;
 
-    let initial_state = State::Leaf(&selector.simple_selectors);
-    return accepts(&initial_state, &nfa, InputValue::Leaf, element,
+    let leaf_state_idx: u32 = 2;    // Index 2 is leaf
+    return accepts(leaf_state_idx, &nfa, InputValue::Leaf, element,
                    shareable, debug_info);
 }
 
