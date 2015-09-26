@@ -5,7 +5,7 @@
 extern crate time as stdtime;
 
 use parser::{CompoundSelector, Combinator, SimpleSelector};
-use matching::{self, DebugInfo};
+use matching::{self, DebugStats};
 use tree::Element;
 use std::collections::HashMap;
 
@@ -94,42 +94,43 @@ use std::collections::HashMap;
 //                  if no prev selector, failure
 
 #[derive(Eq, PartialEq, Clone, Hash, Debug)]
-enum State<'a> {
-    Leaf(&'a Vec<SimpleSelector>),
-    Child(&'a Vec<SimpleSelector>),
-    Descendant(&'a Vec<SimpleSelector>),
-    NextSibling(&'a Vec<SimpleSelector>),
-    LaterSibling(&'a Vec<SimpleSelector>),
+pub enum State {
+    Leaf(Vec<SimpleSelector>),
+    Child(Vec<SimpleSelector>),
+    Descendant(Vec<SimpleSelector>),
+    NextSibling(Vec<SimpleSelector>),
+    LaterSibling(Vec<SimpleSelector>),
     Matched,
     Failed,
 }
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
-enum Symbol {
+pub enum Symbol {
     Matched,
     NotMatched,
     Epsilon,
     EndOfStream,
 }
 
-struct SelectorNFA<'a> {
-    state_list: Vec<State<'a>>,
-    transition_map: HashMap<(u32, Symbol), Vec<u32>>,
+#[derive(PartialEq, Clone, Debug)]
+pub struct SelectorNFA {
+    pub state_list: Vec<State>,
+    pub transition_map: HashMap<(u32, Symbol), Vec<u32>>,
 }
 
-fn get_states_internal<'a, 'b>(selector: &'a CompoundSelector,
-                       state_list: &'b mut Vec<State<'a>>) {
+fn get_states_internal(selector: &CompoundSelector,
+                       state_list: &mut Vec<State>) {
 
     let state = match selector.next {
         None => return,
         Some((ref next_selector, Combinator::Child))
-            => State::Child(&next_selector.simple_selectors),
+            => State::Child(next_selector.simple_selectors.to_vec()),
         Some((ref next_selector, Combinator::Descendant))
-            => State::Descendant(&next_selector.simple_selectors),
+            => State::Descendant(next_selector.simple_selectors.to_vec()),
         Some((ref next_selector, Combinator::NextSibling))
-            => State::NextSibling(&next_selector.simple_selectors),
+            => State::NextSibling(next_selector.simple_selectors.to_vec()),
         Some((ref next_selector, Combinator::LaterSibling))
-            => State::LaterSibling(&next_selector.simple_selectors),
+            => State::LaterSibling(next_selector.simple_selectors.to_vec()),
     };
 
     state_list.push(state);
@@ -140,19 +141,19 @@ fn get_states_internal<'a, 'b>(selector: &'a CompoundSelector,
     };
 }
 
-fn get_states<'a>(selector: &'a CompoundSelector) -> Vec<State<'a>> {
+fn get_states(selector: &CompoundSelector) -> Vec<State> {
     let mut state_list = vec!();
 
     state_list.push(State::Matched);
     state_list.push(State::Failed);
-    state_list.push(State::Leaf(&selector.simple_selectors));
+    state_list.push(State::Leaf(selector.simple_selectors.to_vec()));
 
     get_states_internal(selector, &mut state_list);
 
     return state_list;
 }
 
-fn get_next_state_idx<'a>(idx: usize, state_list: &'a Vec<State>) -> u32 {
+fn get_next_state_idx(idx: usize, state_list: &Vec<State>) -> u32 {
     if idx + 1 >= state_list.len() {
         return 0;  // Index 0 is Matched
     }
@@ -161,8 +162,8 @@ fn get_next_state_idx<'a>(idx: usize, state_list: &'a Vec<State>) -> u32 {
     }
 }
 
-fn build_transition_map<'a>(state_list: &'a Vec<State<'a>>)
-                            -> HashMap<(u32, Symbol), Vec<u32>> {
+fn build_transition_map(state_list: &Vec<State>)
+                        -> HashMap<(u32, Symbol), Vec<u32>> {
 
     let mut map = HashMap::new();
 
@@ -205,7 +206,7 @@ fn build_transition_map<'a>(state_list: &'a Vec<State<'a>>)
     return map;
 }
 
-fn build_nfa<'a>(selector: &'a CompoundSelector) -> SelectorNFA {
+pub fn build_nfa(selector: &CompoundSelector) -> SelectorNFA {
 
     let state_list = get_states(selector);
 
@@ -222,15 +223,14 @@ enum InputValue {
     Parent,
     Sibling,
     Leaf,
-    EndOfStream,
 }
 
 fn eval_selectors<E>(simple_selectors: &[SimpleSelector],
                      element: &E, shareable: &mut bool,
-                     debug_info: &mut DebugInfo)
+                     stats: &mut DebugStats)
                      -> Symbol where E: Element {
     let all_matched = simple_selectors.iter().all(|sel| {
-        matching::matches_simple_selector(sel, element, shareable, debug_info)
+        matching::matches_simple_selector(sel, element, shareable, stats)
     });
 
     if all_matched {
@@ -243,67 +243,64 @@ fn eval_selectors<E>(simple_selectors: &[SimpleSelector],
 
 fn eval_leaf<E>(simple_selectors: &[SimpleSelector],
                 input_value: InputValue, element: &E,
-                shareable: &mut bool, debug_info: &mut DebugInfo)
+                shareable: &mut bool, stats: &mut DebugStats)
                  -> Symbol where E: Element {
     match input_value {
         InputValue::Parent => panic!(),
         InputValue::Sibling => panic!(),
         InputValue::Leaf => eval_selectors(simple_selectors, element,
-                                           shareable, debug_info),
-        InputValue::EndOfStream => panic!(),
+                                           shareable, stats),
     }
 }
 
 fn eval_descendant<E>(simple_selectors: &[SimpleSelector],
                       input_value: InputValue, element: &E,
-                      shareable: &mut bool, debug_info: &mut DebugInfo)
+                      shareable: &mut bool, stats: &mut DebugStats)
                       -> Symbol where E: Element {
     match input_value {
         InputValue::Parent => eval_selectors(simple_selectors, element,
-                                             shareable, debug_info),
+                                             shareable, stats),
         InputValue::Sibling => Symbol::Epsilon,
         InputValue::Leaf => panic!(),
-        InputValue::EndOfStream => Symbol::EndOfStream,
     }
 }
 
 fn eval_sibling<E>(simple_selectors: &[SimpleSelector],
                    input_value: InputValue, element: &E,
-                   shareable: &mut bool, debug_info: &mut DebugInfo)
+                   shareable: &mut bool, stats: &mut DebugStats)
                    -> Symbol where E: Element {
     match input_value {
         InputValue::Parent => Symbol::EndOfStream,
         InputValue::Sibling => eval_selectors(simple_selectors, element,
-                                              shareable, debug_info),
+                                              shareable, stats),
         InputValue::Leaf => panic!(),
-        InputValue::EndOfStream => Symbol::EndOfStream,
     }
 }
 
-fn get_symbol<'a, E>(state: &'a State, input_value: InputValue,
-                     element: &'a E,
-                     shareable: &mut bool, debug_info: &mut DebugInfo)
-                     -> Symbol where E: Element {
+fn get_symbol<E>(state: &State, input_value: InputValue,
+                 element: &E,
+                 shareable: &mut bool, stats: &mut DebugStats)
+                 -> Symbol where E: Element {
     match state {
         &State::Leaf(ref simple_selectors) =>
             eval_leaf(simple_selectors, input_value, element,
-                      shareable, debug_info),
+                      shareable, stats),
         &State::Child(ref simple_selectors) |
         &State::Descendant(ref simple_selectors) =>
             eval_descendant(simple_selectors, input_value, element,
-                            shareable, debug_info),
+                            shareable, stats),
         &State::NextSibling(ref simple_selectors) |
         &State::LaterSibling(ref simple_selectors) =>
             eval_sibling(simple_selectors, input_value, element,
-                         shareable, debug_info),
+                         shareable, stats),
         _ => panic!(),
     }
 }
 
-fn accepts<'a, E>(state_idx: u32, nfa: &'a SelectorNFA,
-                  input_value: InputValue, element: &'a E,
-                  shareable: &mut bool, debug_info: &mut DebugInfo)
-                  -> bool where E: Element {
+fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
+              input_value: InputValue, element: &E,
+              shareable: &mut bool, stats: &mut DebugStats)
+              -> bool where E: Element {
     let ref state = nfa.state_list[state_idx as usize];
 
     match state {
@@ -313,7 +310,7 @@ fn accepts<'a, E>(state_idx: u32, nfa: &'a SelectorNFA,
     };
 
     let symbol = get_symbol(state, input_value, element,
-                            shareable, debug_info);
+                            shareable, stats);
 
     if symbol == Symbol::EndOfStream {
         return false;
@@ -334,15 +331,11 @@ fn accepts<'a, E>(state_idx: u32, nfa: &'a SelectorNFA,
             for next_state in transitions.iter() {
                 let result = match next_element {
                     None =>
-                        // Re-use the same element since we have
-                        // a valid reference to it, it won't get used
-                        accepts(*next_state, nfa,
-                                InputValue::EndOfStream, element,
-                                shareable, debug_info),
+                        nfa.state_list[*next_state as usize] == State::Matched,
                     Some(ref next_element) =>
                         accepts(*next_state, nfa,
                                 next_value, next_element,
-                                shareable, debug_info),
+                                shareable, stats),
                 };
 
                 if result {
@@ -356,19 +349,15 @@ fn accepts<'a, E>(state_idx: u32, nfa: &'a SelectorNFA,
 
 }
 
-pub fn matches_nfa<E>(selector: &CompoundSelector,
-                      element: &E,
+pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
                       shareable: &mut bool,
-                      debug_info: &mut DebugInfo)
+                      stats: &mut DebugStats)
                       -> bool
                       where E: Element {
-
-    let nfa = build_nfa(selector);
-
     *shareable = false;
 
     let leaf_state_idx: u32 = 2;    // Index 2 is leaf
-    return accepts(leaf_state_idx, &nfa, InputValue::Leaf, element,
-                   shareable, debug_info);
+    return accepts(leaf_state_idx, nfa, InputValue::Leaf, element,
+                   shareable, stats);
 }
 

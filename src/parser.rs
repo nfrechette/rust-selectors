@@ -12,6 +12,8 @@ use string_cache::{Atom, Namespace};
 
 use hash_map;
 
+use matching_nfa as nfa;
+
 pub struct ParserContext {
     pub in_user_agent_stylesheet: bool,
     pub default_namespace: Option<Namespace>,
@@ -34,6 +36,7 @@ pub struct Selector {
     pub compound_selectors: Arc<CompoundSelector>,
     pub pseudo_element: Option<PseudoElement>,
     pub specificity: u32,
+    pub nfa: Arc<nfa::SelectorNFA>,
 }
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
@@ -262,10 +265,12 @@ fn parse_selector(context: &ParserContext, input: &mut Parser) -> Result<Selecto
         };
         pseudo_element = pseudo;
     }
+    let nfa = nfa::build_nfa(&compound);
     Ok(Selector {
         specificity: compute_specificity(&compound, &pseudo_element),
         compound_selectors: Arc::new(compound),
         pseudo_element: pseudo_element,
+        nfa: Arc::new(nfa),
     })
 }
 

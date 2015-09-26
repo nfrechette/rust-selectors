@@ -18,6 +18,8 @@ use parser::{SimpleSelector, Selector};
 use tree::Element;
 use hash_map::{self, HashMap};
 
+use matching_nfa as nfa;
+
 /// The definition of whitespace per CSS Selectors Level 3 § 4.
 pub static SELECTOR_WHITESPACE: &'static [char] = &[' ', '\t', '\n', '\r', '\x0C'];
 
@@ -56,17 +58,46 @@ pub struct SelectorMap<T> {
 
 //use std::hash::{Hash, Hasher, SipHasher};
 
-pub struct DebugInfo {
-    pub rules_elapsed_ns: usize,
-    pub num_rules_tested: usize,
-    pub num_rules_matched: usize,
-
+pub struct DebugStats {
     pub selectors_elapsed_ns: usize,
     pub num_selectors_tested: usize,
     pub num_selectors_matched: usize,
 
     pub per_type_tested: HashMap<u64, usize>,
     pub per_type_matched: HashMap<u64, usize>,
+}
+
+impl DebugStats {
+    pub fn new() -> DebugStats {
+        DebugStats {
+            selectors_elapsed_ns: 0,
+            num_selectors_tested: 0,
+            num_selectors_matched: 0,
+            per_type_tested: hash_map::new(),
+            per_type_matched: hash_map::new(),
+        }
+    }
+}
+
+pub struct DebugInfo {
+    pub rules_elapsed_ns: usize,
+    pub num_rules_tested: usize,
+    pub num_rules_matched: usize,
+
+    pub legacy_stats: DebugStats,
+    pub nfa_stats: DebugStats,
+}
+
+impl DebugInfo {
+    pub fn new() -> DebugInfo {
+        DebugInfo {
+            rules_elapsed_ns: 0,
+            num_rules_tested: 0,
+            num_rules_matched: 0,
+            legacy_stats: DebugStats::new(),
+            nfa_stats: DebugStats::new(),
+        }
+    }
 }
 
 impl<T> SelectorMap<T> {
@@ -188,9 +219,17 @@ impl<T> SelectorMap<T> {
             //let st = stdtime::precise_time_ns();
             debug_info.num_rules_tested += 1;
 
-            if matches_compound_selector(&*rule.selector, element, parent_bf, shareable, debug_info) {
+            let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
+
+            if result {
                 debug_info.num_rules_matched += 1;
                 matching_rules.push(rule.declarations.clone());
+            }
+
+            let result_nfa = nfa::matches_nfa(&*rule.nfa, element, shareable, &mut debug_info.nfa_stats);
+            if result != result_nfa {
+                println!("Ref/NFA: {}/{}", result, result_nfa);
+                panic!();
             }
 
             //let et = stdtime::precise_time_ns();
@@ -277,6 +316,7 @@ pub struct Rule<T> {
     // that it matches. Selector contains an owned vector (through
     // CompoundSelector) and we want to avoid the allocation.
     pub selector: Arc<CompoundSelector>,
+    pub nfa: Arc<nfa::SelectorNFA>,
     pub declarations: DeclarationBlock<T>,
 }
 
@@ -307,6 +347,7 @@ impl<T> Clone for Rule<T> {
         Rule {
             selector: self.selector.clone(),
             declarations: self.declarations.clone(),
+            nfa: self.nfa.clone(),
         }
     }
 }
@@ -327,19 +368,10 @@ pub fn matches<E>(selector_list: &Vec<Selector>,
                   parent_bf: Option<&BloomFilter>)
                   -> bool
                   where E: Element {
-    let mut debug_info = DebugInfo {
-        rules_elapsed_ns: 0,
-        num_rules_tested: 0,
-        num_rules_matched: 0,
-        selectors_elapsed_ns: 0,
-        num_selectors_tested: 0,
-        num_selectors_matched: 0,
-        per_type_tested: hash_map::new(),
-        per_type_matched: hash_map::new(),
-    };
+    let mut stats = DebugStats::new();
     selector_list.iter().any(|selector| {
         selector.pseudo_element.is_none() &&
-        matches_compound_selector(&*selector.compound_selectors, element, parent_bf, &mut false, &mut debug_info)
+        matches_compound_selector(&*selector.compound_selectors, element, parent_bf, &mut false, &mut stats)
     })
 }
 
@@ -350,26 +382,17 @@ pub fn matches<E>(selector_list: &Vec<Selector>,
 /// will almost certainly break as elements will start mistakenly sharing styles. (See the code in
 /// `main/css/matching.rs`.)
 
-use matching_nfa as nfa;
-
 fn matches_compound_selector<E>(selector: &CompoundSelector,
                                 element: &E,
                                 parent_bf: Option<&BloomFilter>,
                                 shareable: &mut bool,
-                                debug_info: &mut DebugInfo)
+                                stats: &mut DebugStats)
                                 -> bool
                                 where E: Element {
-    let result = match matches_compound_selector_internal(selector, element, parent_bf, shareable, debug_info) {
+    match matches_compound_selector_internal(selector, element, parent_bf, shareable, stats) {
         SelectorMatchingResult::Matched => true,
         _ => false
-    };
-    let result_nfa = nfa::matches_nfa(selector, element, shareable, debug_info);
-    if result != result_nfa {
-        println!("Ref/NFA: {}/{}", result, result_nfa);
-        panic!();
     }
-    result
-    //result_nfa
 }
 
 /// A result of selector matching, includes 3 failure types,
@@ -429,11 +452,11 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
                       element: &E,
                       parent_bf: Option<&BloomFilter>,
                       shareable: &mut bool,
-                      debug_info: &mut DebugInfo)
+                      stats: &mut DebugStats)
                       -> Option<SelectorMatchingResult>
                       where E: Element {
     if !selector.simple_selectors.iter().all(|simple_selector| {
-      matches_simple_selector(simple_selector, element, shareable, debug_info) }) {
+      matches_simple_selector(simple_selector, element, shareable, stats) }) {
         return Some(SelectorMatchingResult::NotMatchedAndRestartFromClosestLaterSibling);
     }
 
@@ -491,10 +514,10 @@ fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
                                          element: &E,
                                          parent_bf: Option<&BloomFilter>,
                                          shareable: &mut bool,
-                                         debug_info: &mut DebugInfo)
+                                         stats: &mut DebugStats)
                                          -> SelectorMatchingResult
                                          where E: Element {
-    if let Some(result) = can_fast_reject(selector, element, parent_bf, shareable, debug_info) {
+    if let Some(result) = can_fast_reject(selector, element, parent_bf, shareable, stats) {
         return result;
     }
 
@@ -521,7 +544,7 @@ fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
                                                                 &element,
                                                                 parent_bf,
                                                                 shareable,
-                                                                debug_info);
+                                                                stats);
                 match (result, combinator) {
                     // Return the status immediately.
                     (SelectorMatchingResult::Matched, _) => return result,
@@ -622,14 +645,14 @@ pub fn rare_style_affecting_attributes() -> [Atom; 3] {
 pub fn matches_simple_selector<E>(selector: &SimpleSelector,
                                   element: &E,
                                   shareable: &mut bool,
-                                  debug_info: &mut DebugInfo)
+                                  stats: &mut DebugStats)
                                   -> bool
                                   where E: Element {
-    debug_info.num_selectors_tested += 1;
+    stats.num_selectors_tested += 1;
     //let mut hasher = SipHasher::new();
     //selector.hash(&mut hasher);
     //let selector_hash = hasher.finish();
-    //*debug_info.per_type_tested.entry(selector_hash).or_insert(0) += 1;
+    //*stats.per_type_tested.entry(selector_hash).or_insert(0) += 1;
     let st = stdtime::precise_time_ns();
 
     let is_matched = match *selector {
@@ -822,16 +845,16 @@ pub fn matches_simple_selector<E>(selector: &SimpleSelector,
 
         SimpleSelector::Negation(ref negated) => {
             *shareable = false;
-            !negated.iter().all(|s| matches_simple_selector(s, element, shareable, debug_info))
+            !negated.iter().all(|s| matches_simple_selector(s, element, shareable, stats))
         },
     };
 
     let et = stdtime::precise_time_ns();
     let elapsed = (et - st) as usize;
-    debug_info.selectors_elapsed_ns += elapsed;
+    stats.selectors_elapsed_ns += elapsed;
     if is_matched {
-        debug_info.num_selectors_matched += 1;
-        //*debug_info.per_type_matched.entry(selector_hash).or_insert(0) += 1;
+        stats.num_selectors_matched += 1;
+        //*stats.per_type_matched.entry(selector_hash).or_insert(0) += 1;
     }
 
     is_matched
