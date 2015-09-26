@@ -182,13 +182,11 @@ fn build_transition_map(state_list: &Vec<State>)
             &State::Child(..) => {
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
                 map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
-                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::Descendant(..) => {
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx, state_idx]);
                 map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
                 map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
-                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::NextSibling(..) => {
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
@@ -297,6 +295,15 @@ fn get_symbol<E>(state: &State, input_value: InputValue,
     }
 }
 
+fn needs_parent(state_idx: u32, nfa: &SelectorNFA) -> bool {
+    let ref state = nfa.state_list[state_idx as usize];
+    match state {
+        &State::Child(..) |
+        &State::Descendant(..) => true,
+        _ => false,
+    }
+}
+
 fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
               input_value: InputValue, element: &E,
               shareable: &mut bool, stats: &mut DebugStats)
@@ -321,14 +328,14 @@ fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
     match transitions {
         None => {},
         Some(transitions) => {
-            let mut next_element = element.prev_sibling_element();
-            let mut next_value = InputValue::Sibling;
-            if next_element.is_none() {
-                next_element = element.parent_element();
-                next_value = InputValue::Parent;
-            }
-
             for next_state in transitions.iter() {
+                let needs_parent = needs_parent(*next_state, nfa);
+                let (next_element, next_value) = if needs_parent {
+                    (element.parent_element(), InputValue::Parent)
+                } else {
+                    (element.prev_sibling_element(), InputValue::Sibling)
+                };
+
                 let result = match next_element {
                     None =>
                         nfa.state_list[*next_state as usize] == State::Matched,
