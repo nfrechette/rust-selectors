@@ -219,6 +219,8 @@ impl<T> SelectorMap<T> {
             //let st = stdtime::precise_time_ns();
             debug_info.num_rules_tested += 1;
 
+            let mut shareable_nfa = *shareable;
+
             let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
 
             if result {
@@ -226,11 +228,29 @@ impl<T> SelectorMap<T> {
                 matching_rules.push(rule.declarations.clone());
             }
 
-            let result_nfa = nfa::matches_nfa(&*rule.nfa, element, shareable, &mut debug_info.nfa_stats);
+            let result_nfa = nfa::matches_nfa(&*rule.nfa, element,
+                                              &mut shareable_nfa,
+                                              &mut debug_info.nfa_stats);
+
+            let mut should_panic = false;
             if result != result_nfa {
                 println!("Ref/NFA: {}/{}", result, result_nfa);
-                panic!();
+                should_panic = true;
             }
+            if *shareable != shareable_nfa {
+                println!("Ref/NFA shareable: {}/{}", shareable, shareable_nfa);
+                should_panic = true;
+            }
+            if debug_info.legacy_stats.num_selectors_tested != debug_info.nfa_stats.num_selectors_tested {
+                println!("Ref/NFA tested: {}/{}", debug_info.legacy_stats.num_selectors_tested, debug_info.nfa_stats.num_selectors_tested);
+                should_panic = true;
+            }
+            if debug_info.legacy_stats.num_selectors_matched != debug_info.nfa_stats.num_selectors_matched {
+                println!("Ref/NFA matched: {}/{}", debug_info.legacy_stats.num_selectors_matched, debug_info.nfa_stats.num_selectors_matched);
+                should_panic = true;
+            }
+
+            if should_panic { panic!(); }
 
             //let et = stdtime::precise_time_ns();
             //let elapsed = (et - st) as usize;
@@ -460,6 +480,9 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
         return Some(SelectorMatchingResult::NotMatchedAndRestartFromClosestLaterSibling);
     }
 
+    // hack!
+    return None;
+/*
     let bf: &BloomFilter = match parent_bf {
         None => return None,
         Some(ref bf) => bf,
@@ -508,6 +531,7 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
 
     // Can't fast reject.
     return None;
+*/
 }
 
 fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
