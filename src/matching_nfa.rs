@@ -162,6 +162,21 @@ fn get_next_state_idx(idx: usize, state_list: &Vec<State>) -> u32 {
     }
 }
 
+pub fn to_string(state_list: &Vec<State>) -> String {
+    let mut result = String::new();
+    for state in state_list.iter() {
+        match state {
+            &State::Leaf(..) => { result.push_str("$"); }
+            &State::Child(..) => { result.push_str(">"); }
+            &State::Descendant(..) => { result.push_str(" "); }
+            &State::NextSibling(..) => { result.push_str("+"); }
+            &State::LaterSibling(..) => { result.push_str("~"); }
+            _ => {}
+        };
+    }
+    return result;
+}
+
 fn build_transition_map(state_list: &Vec<State>)
                         -> HashMap<(u32, Symbol), Vec<u32>> {
 
@@ -169,37 +184,96 @@ fn build_transition_map(state_list: &Vec<State>)
 
     let failed_idx: u32 = 1; // Index 1 is Failed
 
-    for state_idx in 0 .. state_list.len() {
-        let ref state = state_list[state_idx];
+    for (state_idx, state) in state_list.iter().enumerate() {
         let next_state_idx = get_next_state_idx(state_idx, state_list);
-        let state_idx: u32 = state_idx as u32;
+        let state_idx = state_idx as u32;
 
         match state {
             &State::Leaf(..) => {
+                // If we match, move on to the next state
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                // If we do not match, we failed and can never match
                 map.insert((state_idx, Symbol::NotMatched), vec![failed_idx]);
+                // No epsilon transitions for leaf state
+                // No end of stream for leaf state since we always at least
+                // have a root node
             }
             &State::Child(..) => {
+                // If we match, move on to the next state
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                // If we do not match, we backtrack to a previous state
+                // If we hit a sibling node, we skip it
                 map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                // If we reach the end of the parent nodes,
+                // matching will never happen
+                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::Descendant(..) => {
-                map.insert((state_idx, Symbol::Matched), vec![next_state_idx, state_idx]);
+                // If we match, we try the next state and retry with the
+                // next node if the next state fails and backtracks
+                map.insert((state_idx, Symbol::Matched),
+                           vec![next_state_idx, state_idx]);
+                // If we don't match, we skip the node
                 map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
+                // If we hit a sibling node, we skip it
                 map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                // If we reach the end of the parent nodes,
+                // matching will never happen
+                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
             }
             &State::NextSibling(..) => {
+                // If we match, move on to the next state
                 map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                // If we do not match, we backtrack to a previous state
+                // No epsilon transition for next sibling state
+                // If we reach the end of the sibling nodes, we backtrack
             }
             &State::LaterSibling(..) => {
-                map.insert((state_idx, Symbol::Matched), vec![next_state_idx, state_idx]);
+                // If we match, we try the next state and retry with the
+                // next node if the next state fails and backtracks
+                map.insert((state_idx, Symbol::Matched),
+                           vec![next_state_idx, state_idx]);
+                // If we don't match, we skip the node
                 map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
-                // TODO: Prune matched epsilon transition in special cases
+                // No epsilon transition for later sibling state
+                // If we reach the end of the sibling nodes, we backtrack
             }
+            // These two states are our final accepting states
             &State::Matched => {}
             &State::Failed => {}
         }
     }
+
+    //println!("DEBUG CSS RULE: [{}]", to_string(state_list));
+/*
+    // Prune epsilon transitions for early-out conditions
+    for (state_idx, state) in state_list.iter().enumerate() {
+        match state {
+            &State::LaterSibling(..) => {
+                let mut cursor_idx = state_idx + 1;
+                while cursor_idx < state_list.len() {
+                    match &state_list[cursor_idx] {
+                        &State::NextSibling(..) => { cursor_idx += 1; }
+                        _ => { break; }
+                    };
+                }
+
+                if cursor_idx < state_list.len() {
+                    match &state_list[cursor_idx] {
+                        &State::Child(..) => {
+                            println!("Early out from child at {}. [{}]", cursor_idx, to_string(state_list));
+                            let cursor_idx = cursor_idx as u32;
+                            let ls = map.get_mut(&(cursor_idx, Symbol::Matched));
+                            ls.unwrap().pop();
+                        }
+                        _ => {}
+                    };
+                }
+            }
+            _ => {}
+        };
+    }
+*/
 
     return map;
 }
@@ -240,9 +314,13 @@ fn eval_selectors<E>(simple_selectors: &[SimpleSelector],
 }
 
 fn eval_leaf<E>(simple_selectors: &[SimpleSelector],
-                input_value: InputValue, element: &E,
+                input_value: InputValue, element: Option<&E>,
                 shareable: &mut bool, stats: &mut DebugStats)
                  -> Symbol where E: Element {
+    let element = match element {
+        None => panic!(),
+        Some(e) => e,
+    };
     match input_value {
         InputValue::Parent => panic!(),
         InputValue::Sibling => panic!(),
@@ -252,9 +330,13 @@ fn eval_leaf<E>(simple_selectors: &[SimpleSelector],
 }
 
 fn eval_descendant<E>(simple_selectors: &[SimpleSelector],
-                      input_value: InputValue, element: &E,
+                      input_value: InputValue, element: Option<&E>,
                       shareable: &mut bool, stats: &mut DebugStats)
                       -> Symbol where E: Element {
+    let element = match element {
+        None => return Symbol::EndOfStream,
+        Some(e) => e,
+    };
     match input_value {
         InputValue::Parent => eval_selectors(simple_selectors, element,
                                              shareable, stats),
@@ -264,9 +346,13 @@ fn eval_descendant<E>(simple_selectors: &[SimpleSelector],
 }
 
 fn eval_sibling<E>(simple_selectors: &[SimpleSelector],
-                   input_value: InputValue, element: &E,
+                   input_value: InputValue, element: Option<&E>,
                    shareable: &mut bool, stats: &mut DebugStats)
                    -> Symbol where E: Element {
+    let element = match element {
+        None => return Symbol::EndOfStream,
+        Some(e) => e,
+    };
     match input_value {
         InputValue::Parent => Symbol::EndOfStream,
         InputValue::Sibling => eval_selectors(simple_selectors, element,
@@ -276,7 +362,7 @@ fn eval_sibling<E>(simple_selectors: &[SimpleSelector],
 }
 
 fn get_symbol<E>(state: &State, input_value: InputValue,
-                 element: &E,
+                 element: Option<&E>,
                  shareable: &mut bool, stats: &mut DebugStats)
                  -> Symbol where E: Element {
     match state {
@@ -295,6 +381,61 @@ fn get_symbol<E>(state: &State, input_value: InputValue,
     }
 }
 
+#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
+enum EvaluationResult {
+    Matched,
+    NotMatched,
+    Backtrack,
+}
+
+fn accepts_ref<E>(state_idx: u32, nfa: &SelectorNFA,
+                  input_value: InputValue, element: Option<&E>,
+                  shareable: &mut bool, stats: &mut DebugStats)
+                  -> EvaluationResult where E: Element {
+    let ref state = nfa.state_list[state_idx as usize];
+
+    // Check if we are a final accepting state
+    match state {
+        &State::Matched => return EvaluationResult::Matched,
+        &State::Failed => return EvaluationResult::NotMatched,
+        _ => {}
+    };
+
+    // Convert our input element into a symbol
+    let symbol = get_symbol(state, input_value, element,
+                            shareable, stats);
+
+    // Look up our possible transitions and try them
+    let transitions = nfa.transition_map.get(&(state_idx, symbol));
+
+    match transitions {
+        None => {},
+        Some(transitions) => {
+            let mut next_element = element.map_or(None, |e| e.prev_sibling_element());
+            let mut next_value = InputValue::Sibling;
+            if next_element.is_none() {
+                next_element = element.map_or(None, |e| e.parent_element());
+                next_value = InputValue::Parent;
+            }
+
+            for next_state in transitions.iter() {
+                let result = accepts_ref(*next_state, nfa, next_value,
+                                         next_element.as_ref(),
+                                         shareable, stats);
+
+                if result != EvaluationResult::Backtrack {
+                    // If we aren't backtracking, return
+                    return result;
+                }
+            }
+        }
+    };
+
+    // If we didn't find a transition or if they all asked to backtrack,
+    // we backtrack
+    return EvaluationResult::Backtrack;
+}
+
 fn needs_parent(state_idx: u32, nfa: &SelectorNFA) -> bool {
     let ref state = nfa.state_list[state_idx as usize];
     match state {
@@ -305,24 +446,23 @@ fn needs_parent(state_idx: u32, nfa: &SelectorNFA) -> bool {
 }
 
 fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
-              input_value: InputValue, element: &E,
+              input_value: InputValue, element: Option<&E>,
               shareable: &mut bool, stats: &mut DebugStats)
-              -> bool where E: Element {
+              -> EvaluationResult where E: Element {
     let ref state = nfa.state_list[state_idx as usize];
 
+    // Check if we are a final accepting state
     match state {
-        &State::Matched => return true,
-        &State::Failed => return false,
+        &State::Matched => return EvaluationResult::Matched,
+        &State::Failed => return EvaluationResult::NotMatched,
         _ => {}
     };
 
+    // Convert our input element into a symbol
     let symbol = get_symbol(state, input_value, element,
                             shareable, stats);
 
-    if symbol == Symbol::EndOfStream {
-        return false;
-    }
-
+    // Look up our possible transitions and try them
     let transitions = nfa.transition_map.get(&(state_idx, symbol));
 
     match transitions {
@@ -331,40 +471,55 @@ fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
             for next_state in transitions.iter() {
                 let needs_parent = needs_parent(*next_state, nfa);
                 let (next_element, next_value) = if needs_parent {
-                    (element.parent_element(), InputValue::Parent)
+                    (element.map_or(None, |e| e.parent_element()),
+                     InputValue::Parent)
                 } else {
-                    (element.prev_sibling_element(), InputValue::Sibling)
+                    (element.map_or(None, |e| e.prev_sibling_element()),
+                     InputValue::Sibling)
                 };
 
-                let result = match next_element {
-                    None =>
-                        nfa.state_list[*next_state as usize] == State::Matched,
-                    Some(ref next_element) =>
-                        accepts(*next_state, nfa,
-                                next_value, next_element,
-                                shareable, stats),
-                };
+                let result = accepts_ref(*next_state, nfa, next_value,
+                                         next_element.as_ref(),
+                                         shareable, stats);
 
-                if result {
-                    return true;
+                if result != EvaluationResult::Backtrack {
+                    // If we aren't backtracking, return
+                    return result;
                 }
             }
         }
     };
 
-    return false;
+    // If we didn't find a transition or if they all asked to backtrack,
+    // we backtrack
+    return EvaluationResult::Backtrack;
+}
 
+pub fn matches_nfa_ref<E>(nfa: &SelectorNFA, element: &E,
+                          shareable: &mut bool,
+                          stats: &mut DebugStats)
+                          -> bool where E: Element {
+    let leaf_state_idx = 2;    // Index 2 is leaf
+    let result = accepts_ref(leaf_state_idx, nfa, InputValue::Leaf,
+                             Some(element), shareable, stats);
+    return result == EvaluationResult::Matched;
+}
+
+pub fn matches_nfa_opt<E>(nfa: &SelectorNFA, element: &E,
+                          shareable: &mut bool,
+                          stats: &mut DebugStats)
+                          -> bool where E: Element {
+    let leaf_state_idx = 2;    // Index 2 is leaf
+    let result = accepts(leaf_state_idx, nfa, InputValue::Leaf,
+                         Some(element), shareable, stats);
+    return result == EvaluationResult::Matched;
 }
 
 pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
                       shareable: &mut bool,
                       stats: &mut DebugStats)
-                      -> bool
-                      where E: Element {
-    *shareable = false;
-
-    let leaf_state_idx: u32 = 2;    // Index 2 is leaf
-    return accepts(leaf_state_idx, nfa, InputValue::Leaf, element,
-                   shareable, stats);
+                      -> bool where E: Element {
+    //return matches_nfa_ref(nfa, element, shareable, stats);
+    return matches_nfa_opt(nfa, element, shareable, stats);
 }
 
