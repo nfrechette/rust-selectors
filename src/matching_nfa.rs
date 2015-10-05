@@ -112,10 +112,32 @@ pub enum Symbol {
     EndOfStream,
 }
 
+fn get_symbol_index(symbol: Symbol) -> usize {
+    match symbol {
+        Symbol::Matched =>      0,
+        Symbol::NotMatched =>   1,
+        Symbol::Epsilon =>      2,
+        Symbol::EndOfStream =>  3,
+    }
+}
+
+static NUM_SYMBOLS: usize = 4;
+
 #[derive(PartialEq, Clone, Debug)]
 pub struct SelectorNFA {
+    // Store the list of NFA states including the simple selectors (copied)
     pub state_list: Vec<State>,
-    pub transition_map: HashMap<(u32, Symbol), Vec<u32>>,
+
+    // Simple transition map: (current state idx, symbol) -> next state idx list
+    pub transition_map: HashMap<(usize, Symbol), Vec<usize>>,
+
+    // Compact transition map:
+    // Each transition leads to at most 2 states, a new state and the current
+    // state (epsilon transition). We use a u8 to store this. If the MSB is
+    // set, we have an epsilon transition otherwise we do not. The rest of
+    // the bits store the next state index. 7 bits allow for 128 states.
+    // The size of the array is Num States * Num Symbols
+    pub compact_transition_map: Vec<u8>,
 }
 
 fn get_states_internal(selector: &CompoundSelector,
@@ -153,12 +175,12 @@ fn get_states(selector: &CompoundSelector) -> Vec<State> {
     return state_list;
 }
 
-fn get_next_state_idx(idx: usize, state_list: &Vec<State>) -> u32 {
+fn get_next_state_idx(idx: usize, state_list: &Vec<State>) -> usize {
     if idx + 1 >= state_list.len() {
         return 0;  // Index 0 is Matched
     }
     else {
-        return idx as u32 + 1;
+        return idx + 1;
     }
 }
 
@@ -178,15 +200,14 @@ pub fn to_string(state_list: &Vec<State>) -> String {
 }
 
 fn build_transition_map(state_list: &Vec<State>)
-                        -> HashMap<(u32, Symbol), Vec<u32>> {
+                        -> HashMap<(usize, Symbol), Vec<usize>> {
 
     let mut map = HashMap::new();
 
-    let failed_idx: u32 = 1; // Index 1 is Failed
+    let failed_idx = 1; // Index 1 is Failed
 
     for (state_idx, state) in state_list.iter().enumerate() {
         let next_state_idx = get_next_state_idx(state_idx, state_list);
-        let state_idx = state_idx as u32;
 
         match state {
             &State::Leaf(..) => {
@@ -278,15 +299,60 @@ fn build_transition_map(state_list: &Vec<State>)
     return map;
 }
 
+fn build_compact_transition_map(state_list: &Vec<State>,
+                        transition_map: &HashMap<(usize, Symbol), Vec<usize>>)
+                        -> Vec<u8> {
+    // TODO: Right now we panic if we have too many states, in practice
+    // we would want to detect this and fallback to the reference impl.
+    if state_list.len() > 128 { panic!(); }
+
+    let compact_map_size = state_list.len() * NUM_SYMBOLS;
+    let mut compact_map = vec![!0u8; compact_map_size];
+
+    let symbols = [Symbol::Matched, Symbol::NotMatched,
+                   Symbol::Epsilon, Symbol::EndOfStream];
+
+    for (state_idx, _) in state_list.iter().enumerate() {
+        for symbol in symbols.iter() {
+            let symbol_idx = get_symbol_index(*symbol);
+            let map_idx = (state_idx * NUM_SYMBOLS) + symbol_idx;
+            let key = (state_idx, *symbol);
+
+            let transitions = transition_map.get(&key);
+            let transition = match transitions {
+                None => !0u8,
+                Some(transitions) => {
+                    let mut transition = transitions[0] as u8;
+                    if transitions.len() > 1 {
+                        // TODO: Convert to asserts?
+                        if transitions.len() > 2 { panic!(); }
+                        if transitions[1] != state_idx { panic!(); }
+
+                        // Epsilon transition
+                        transition |= 1 << 7;
+                    }
+                    transition
+                },
+            };
+
+            compact_map[map_idx] = transition;
+        }
+    }
+
+    return compact_map;
+}
+
 pub fn build_nfa(selector: &CompoundSelector) -> SelectorNFA {
 
     let state_list = get_states(selector);
 
     let map = build_transition_map(&state_list);
+    let compact_map = build_compact_transition_map(&state_list, &map);
 
     return SelectorNFA {
         state_list: state_list,
         transition_map: map,
+        compact_transition_map: compact_map,
     };
 }
 
@@ -388,11 +454,11 @@ enum EvaluationResult {
     Backtrack,
 }
 
-fn accepts_ref<E>(state_idx: u32, nfa: &SelectorNFA,
+fn accepts_ref<E>(state_idx: usize, nfa: &SelectorNFA,
                   input_value: InputValue, element: Option<&E>,
                   shareable: &mut bool, stats: &mut DebugStats)
                   -> EvaluationResult where E: Element {
-    let ref state = nfa.state_list[state_idx as usize];
+    let ref state = nfa.state_list[state_idx];
 
     // Check if we are a final accepting state
     match state {
@@ -436,8 +502,8 @@ fn accepts_ref<E>(state_idx: u32, nfa: &SelectorNFA,
     return EvaluationResult::Backtrack;
 }
 
-fn needs_parent(state_idx: u32, nfa: &SelectorNFA) -> bool {
-    let ref state = nfa.state_list[state_idx as usize];
+fn needs_parent(state_idx: usize, nfa: &SelectorNFA) -> bool {
+    let ref state = nfa.state_list[state_idx];
     match state {
         &State::Child(..) |
         &State::Descendant(..) => true,
@@ -445,11 +511,11 @@ fn needs_parent(state_idx: u32, nfa: &SelectorNFA) -> bool {
     }
 }
 
-fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
+fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
               input_value: InputValue, element: Option<&E>,
               shareable: &mut bool, stats: &mut DebugStats)
               -> EvaluationResult where E: Element {
-    let ref state = nfa.state_list[state_idx as usize];
+    let ref state = nfa.state_list[state_idx];
 
     // Check if we are a final accepting state
     match state {
@@ -463,35 +529,61 @@ fn accepts<E>(state_idx: u32, nfa: &SelectorNFA,
                             shareable, stats);
 
     // Look up our possible transitions and try them
-    let transitions = nfa.transition_map.get(&(state_idx, symbol));
+    let symbol_idx = get_symbol_index(symbol);
+    let transition_idx = (state_idx * NUM_SYMBOLS) + symbol_idx;
+    let transitions = nfa.compact_transition_map[transition_idx];
 
-    match transitions {
-        None => {},
-        Some(transitions) => {
-            for next_state in transitions.iter() {
-                let needs_parent = needs_parent(*next_state, nfa);
-                let (next_element, next_value) = if needs_parent {
-                    (element.map_or(None, |e| e.parent_element()),
-                     InputValue::Parent)
-                } else {
-                    (element.map_or(None, |e| e.prev_sibling_element()),
-                     InputValue::Sibling)
-                };
+    if transitions == !0 {
+        // No transitions, backtrack!
+        return EvaluationResult::Backtrack;
+    }
 
-                let result = accepts_ref(*next_state, nfa, next_value,
-                                         next_element.as_ref(),
-                                         shareable, stats);
+    // Try our next state first
+    {
+        let next_state_idx = (transitions & !(1 << 7)) as usize;
+        let needs_parent = needs_parent(next_state_idx, nfa);
+        let (next_element, next_value) = if needs_parent {
+            (element.map_or(None, |e| e.parent_element()), InputValue::Parent)
+        } else {
+            (element.map_or(None, |e| e.prev_sibling_element()), InputValue::Sibling)
+        };
 
-                if result != EvaluationResult::Backtrack {
-                    // If we aren't backtracking, return
-                    return result;
-                }
-            }
+        let result = accepts_ref(next_state_idx, nfa, next_value,
+                                 next_element.as_ref(),
+                                 shareable, stats);
+
+        if result != EvaluationResult::Backtrack {
+            // If we aren't backtracking, return
+            return result;
         }
-    };
+    }
 
-    // If we didn't find a transition or if they all asked to backtrack,
-    // we backtrack
+    if (transitions & (1 << 7)) == 0 {
+        // No epsilon transition and our next state transition backtracked
+        return EvaluationResult::Backtrack;
+    }
+
+    // Now try the epsilon transition to our current state
+    {
+        let next_state_idx = state_idx;
+        let needs_parent = needs_parent(next_state_idx, nfa);
+        let (next_element, next_value) = if needs_parent {
+            (element.map_or(None, |e| e.parent_element()), InputValue::Parent)
+        } else {
+            (element.map_or(None, |e| e.prev_sibling_element()), InputValue::Sibling)
+        };
+
+        let result = accepts_ref(next_state_idx, nfa, next_value,
+                                 next_element.as_ref(),
+                                 shareable, stats);
+
+        if result != EvaluationResult::Backtrack {
+            // If we aren't backtracking, return
+            return result;
+        }
+    }
+
+    // Everything backtracked, we backtrack
     return EvaluationResult::Backtrack;
 }
 
