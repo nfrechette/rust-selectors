@@ -4,10 +4,11 @@
 
 extern crate time as stdtime;
 
-use parser::{CompoundSelector, Combinator, SimpleSelector};
+use parser::{CompoundSelector, Combinator, SimpleSelector, LocalName};
 use matching::{self, DebugStats};
 use tree::Element;
 use std::collections::HashMap;
+use bloom::BloomFilter;
 
 // Our alphabet is:
 //      parent matched
@@ -356,6 +357,84 @@ pub fn build_nfa(selector: &CompoundSelector) -> SelectorNFA {
     };
 }
 
+fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
+                               parent_bf: Option<&BloomFilter>,
+                               hier_level: usize,
+                               last_tested_hier_level: &mut usize)
+                               -> bool {
+    // The parent bloom filter holds whether or not some properties
+    // might have been supported by the parent nodes.
+    // Thus, if a particular descendant state matches with the bloom filter
+    // at a particular node, all children nodes will also match but not
+    // necessarily the parent nodes. But, if a particular descendant state
+    // does NOT match with the bloom filter, no parent node can match since
+    // they would remove information but children nodes could match.
+    //
+    // Since we iterate on nodes towards the parent, as soon as a descendant
+    // state does not match, we can never match. Additionally, if our
+    // descendant state matches, it will also match for all current siblings
+    // since they share the same parent bloom filter. This means we only
+    // need to test the bloom filter if the current state matches AND we
+    // moved up in the hierarchy since the last test. Incidentally, if we
+    // backtrack, we can cache the result since it will never change.
+
+    let bf = match parent_bf {
+        None => return false,
+        Some(ref bf) => bf,
+    };
+
+    if hier_level <= *last_tested_hier_level {
+        // We already tested this level. If we had been rejected we would have
+        // terminated. We thus obviously still match.
+        return false;
+    }
+
+    for next_state_idx in state_idx + 1 .. nfa.state_list.len() {
+        let ref state = nfa.state_list[next_state_idx];
+
+        // TODO: See if we should test child states as well? Original impl
+        // doesn't but is that correct?
+
+        let ref simple_selectors = match state {
+            &State::Descendant(ref simple_selectors) => simple_selectors,
+            _ => continue,
+        };
+
+        for ss in simple_selectors.iter() {
+            match *ss {
+                SimpleSelector::LocalName(LocalName { ref name, ref lower_name }) => {
+                    if !bf.might_contain(name)
+                    && !bf.might_contain(lower_name) {
+                        return true;
+                    }
+                },
+                SimpleSelector::Namespace(ref namespace) => {
+                    if !bf.might_contain(namespace) {
+                        return true;
+                    }
+                },
+                SimpleSelector::ID(ref id) => {
+                    if !bf.might_contain(id) {
+                        return true;
+                    }
+                },
+                SimpleSelector::Class(ref class) => {
+                    if !bf.might_contain(class) {
+                        return true;
+                    }
+                },
+                _ => {},
+            };
+        }
+    }
+
+    // Update our last tested level which also implies our last non-rejected
+    // level
+    *last_tested_hier_level = hier_level;
+
+    return false;
+}
+
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
 enum InputValue {
     Parent,
@@ -363,26 +442,39 @@ enum InputValue {
     Leaf,
 }
 
-fn eval_selectors<E>(simple_selectors: &[SimpleSelector],
-                     element: &E, shareable: &mut bool,
-                     stats: &mut DebugStats)
-                     -> Symbol where E: Element {
+fn eval_selectors<E>(state_idx: usize, nfa: &SelectorNFA,
+                     hier_level: usize,
+                     last_tested_hier_level: &mut usize,
+                     element: &E, parent_bf: Option<&BloomFilter>,
+                     simple_selectors: &[SimpleSelector],
+                     shareable: &mut bool, stats: &mut DebugStats)
+                -> Symbol where E: Element {
     let all_matched = simple_selectors.iter().all(|sel| {
         matching::matches_simple_selector(sel, element, shareable, stats)
     });
 
-    if all_matched {
-        return Symbol::Matched;
-    }
-    else {
+    if !all_matched {
         return Symbol::NotMatched;
     }
+
+    if is_rejected_by_bloom_filter(state_idx, nfa, parent_bf,
+                                   hier_level, last_tested_hier_level) {
+        // If the bloom filter rejects our descendant selectors, simulate
+        // the end of the stream since we can never match
+        return Symbol::EndOfStream;
+    }
+
+    return Symbol::Matched;
 }
 
-fn eval_leaf<E>(simple_selectors: &[SimpleSelector],
+fn eval_leaf<E>(state_idx: usize, nfa: &SelectorNFA,
+                hier_level: usize,
+                last_tested_hier_level: &mut usize,
                 input_value: InputValue, element: Option<&E>,
+                parent_bf: Option<&BloomFilter>,
+                simple_selectors: &[SimpleSelector],
                 shareable: &mut bool, stats: &mut DebugStats)
-                 -> Symbol where E: Element {
+            -> Symbol where E: Element {
     let element = match element {
         None => panic!(),
         Some(e) => e,
@@ -390,59 +482,84 @@ fn eval_leaf<E>(simple_selectors: &[SimpleSelector],
     match input_value {
         InputValue::Parent => panic!(),
         InputValue::Sibling => panic!(),
-        InputValue::Leaf => eval_selectors(simple_selectors, element,
+        InputValue::Leaf => eval_selectors(state_idx, nfa, hier_level,
+                                           last_tested_hier_level,
+                                           element, parent_bf,
+                                           simple_selectors,
                                            shareable, stats),
     }
 }
 
-fn eval_descendant<E>(simple_selectors: &[SimpleSelector],
+fn eval_descendant<E>(state_idx: usize, nfa: &SelectorNFA,
+                      hier_level: usize,
+                      last_tested_hier_level: &mut usize,
                       input_value: InputValue, element: Option<&E>,
+                      parent_bf: Option<&BloomFilter>,
+                      simple_selectors: &[SimpleSelector],
                       shareable: &mut bool, stats: &mut DebugStats)
-                      -> Symbol where E: Element {
-    let element = match element {
-        None => return Symbol::EndOfStream,
-        Some(e) => e,
-    };
-    match input_value {
-        InputValue::Parent => eval_selectors(simple_selectors, element,
-                                             shareable, stats),
-        InputValue::Sibling => Symbol::Epsilon,
-        InputValue::Leaf => panic!(),
-    }
-}
-
-fn eval_sibling<E>(simple_selectors: &[SimpleSelector],
-                   input_value: InputValue, element: Option<&E>,
-                   shareable: &mut bool, stats: &mut DebugStats)
                    -> Symbol where E: Element {
     let element = match element {
         None => return Symbol::EndOfStream,
         Some(e) => e,
     };
     match input_value {
+        InputValue::Parent => eval_selectors(state_idx, nfa, hier_level,
+                                             last_tested_hier_level,
+                                             element, parent_bf,
+                                             simple_selectors,
+                                             shareable, stats),
+        InputValue::Sibling => Symbol::Epsilon,
+        InputValue::Leaf => panic!(),
+    }
+}
+
+fn eval_sibling<E>(state_idx: usize, nfa: &SelectorNFA,
+                   hier_level: usize,
+                   last_tested_hier_level: &mut usize,
+                   input_value: InputValue, element: Option<&E>,
+                   parent_bf: Option<&BloomFilter>,
+                   simple_selectors: &[SimpleSelector],
+                   shareable: &mut bool, stats: &mut DebugStats)
+                -> Symbol where E: Element {
+    let element = match element {
+        None => return Symbol::EndOfStream,
+        Some(e) => e,
+    };
+    match input_value {
         InputValue::Parent => Symbol::EndOfStream,
-        InputValue::Sibling => eval_selectors(simple_selectors, element,
+        InputValue::Sibling => eval_selectors(state_idx, nfa, hier_level,
+                                              last_tested_hier_level,
+                                              element, parent_bf,
+                                              simple_selectors,
                                               shareable, stats),
         InputValue::Leaf => panic!(),
     }
 }
 
-fn get_symbol<E>(state: &State, input_value: InputValue,
-                 element: Option<&E>,
+fn get_symbol<E>(state_idx: usize, nfa: &SelectorNFA,
+                 hier_level: usize,
+                 last_tested_hier_level: &mut usize,
+                 input_value: InputValue, element: Option<&E>,
+                 parent_bf: Option<&BloomFilter>,
                  shareable: &mut bool, stats: &mut DebugStats)
                  -> Symbol where E: Element {
+    let ref state = nfa.state_list[state_idx];
+
     match state {
         &State::Leaf(ref simple_selectors) =>
-            eval_leaf(simple_selectors, input_value, element,
-                      shareable, stats),
+            eval_leaf(state_idx, nfa, hier_level,
+                      last_tested_hier_level, input_value, element,
+                      parent_bf, simple_selectors, shareable, stats),
         &State::Child(ref simple_selectors) |
         &State::Descendant(ref simple_selectors) =>
-            eval_descendant(simple_selectors, input_value, element,
-                            shareable, stats),
+            eval_descendant(state_idx, nfa, hier_level,
+                            last_tested_hier_level, input_value, element,
+                            parent_bf, simple_selectors, shareable, stats),
         &State::NextSibling(ref simple_selectors) |
         &State::LaterSibling(ref simple_selectors) =>
-            eval_sibling(simple_selectors, input_value, element,
-                         shareable, stats),
+            eval_sibling(state_idx, nfa, hier_level,
+                         last_tested_hier_level, input_value, element,
+                         parent_bf, simple_selectors, shareable, stats),
         _ => panic!(),
     }
 }
@@ -455,7 +572,9 @@ enum EvaluationResult {
 }
 
 fn accepts_ref<E>(state_idx: usize, nfa: &SelectorNFA,
+                  hier_level: usize, last_tested_hier_level: &mut usize,
                   input_value: InputValue, element: Option<&E>,
+                  parent_bf: Option<&BloomFilter>,
                   shareable: &mut bool, stats: &mut DebugStats)
                   -> EvaluationResult where E: Element {
     let ref state = nfa.state_list[state_idx];
@@ -468,7 +587,9 @@ fn accepts_ref<E>(state_idx: usize, nfa: &SelectorNFA,
     };
 
     // Convert our input element into a symbol
-    let symbol = get_symbol(state, input_value, element,
+    let symbol = get_symbol(state_idx, nfa,
+                            hier_level, last_tested_hier_level,
+                            input_value, element, parent_bf,
                             shareable, stats);
 
     // Look up our possible transitions and try them
@@ -479,14 +600,18 @@ fn accepts_ref<E>(state_idx: usize, nfa: &SelectorNFA,
         Some(transitions) => {
             let mut next_element = element.map_or(None, |e| e.prev_sibling_element());
             let mut next_value = InputValue::Sibling;
+            let mut next_hier_level = hier_level;
             if next_element.is_none() {
                 next_element = element.map_or(None, |e| e.parent_element());
                 next_value = InputValue::Parent;
+                next_hier_level += 1;
             }
 
             for next_state in transitions.iter() {
-                let result = accepts_ref(*next_state, nfa, next_value,
-                                         next_element.as_ref(),
+                let result = accepts_ref(*next_state, nfa, next_hier_level,
+                                         last_tested_hier_level,
+                                         next_value,
+                                         next_element.as_ref(), parent_bf,
                                          shareable, stats);
 
                 if result != EvaluationResult::Backtrack {
@@ -511,9 +636,11 @@ fn needs_parent(state_idx: usize, nfa: &SelectorNFA) -> bool {
     }
 }
 
-fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
-              input_value: InputValue, element: Option<&E>,
-              shareable: &mut bool, stats: &mut DebugStats)
+fn accepts_opt<E>(state_idx: usize, nfa: &SelectorNFA,
+                  hier_level: usize, last_tested_hier_level: &mut usize,
+                  input_value: InputValue, element: Option<&E>,
+                  parent_bf: Option<&BloomFilter>,
+                  shareable: &mut bool, stats: &mut DebugStats)
               -> EvaluationResult where E: Element {
     let ref state = nfa.state_list[state_idx];
 
@@ -525,7 +652,9 @@ fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
     };
 
     // Convert our input element into a symbol
-    let symbol = get_symbol(state, input_value, element,
+    let symbol = get_symbol(state_idx, nfa,
+                            hier_level, last_tested_hier_level,
+                            input_value, element, parent_bf,
                             shareable, stats);
 
     // Look up our possible transitions and try them
@@ -542,14 +671,17 @@ fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
     {
         let next_state_idx = (transitions & !(1 << 7)) as usize;
         let needs_parent = needs_parent(next_state_idx, nfa);
-        let (next_element, next_value) = if needs_parent {
-            (element.map_or(None, |e| e.parent_element()), InputValue::Parent)
+        let (next_element, next_value, next_hier_level) = if needs_parent {
+            (element.map_or(None, |e| e.parent_element()),
+             InputValue::Parent, hier_level + 1)
         } else {
-            (element.map_or(None, |e| e.prev_sibling_element()), InputValue::Sibling)
+            (element.map_or(None, |e| e.prev_sibling_element()),
+             InputValue::Sibling, hier_level)
         };
 
-        let result = accepts_ref(next_state_idx, nfa, next_value,
-                                 next_element.as_ref(),
+        let result = accepts_opt(next_state_idx, nfa, next_hier_level,
+                                 last_tested_hier_level, next_value,
+                                 next_element.as_ref(), parent_bf,
                                  shareable, stats);
 
         if result != EvaluationResult::Backtrack {
@@ -567,14 +699,17 @@ fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
     {
         let next_state_idx = state_idx;
         let needs_parent = needs_parent(next_state_idx, nfa);
-        let (next_element, next_value) = if needs_parent {
-            (element.map_or(None, |e| e.parent_element()), InputValue::Parent)
+        let (next_element, next_value, next_hier_level) = if needs_parent {
+            (element.map_or(None, |e| e.parent_element()),
+             InputValue::Parent, hier_level + 1)
         } else {
-            (element.map_or(None, |e| e.prev_sibling_element()), InputValue::Sibling)
+            (element.map_or(None, |e| e.prev_sibling_element()),
+             InputValue::Sibling, hier_level)
         };
 
-        let result = accepts_ref(next_state_idx, nfa, next_value,
-                                 next_element.as_ref(),
+        let result = accepts_opt(next_state_idx, nfa, next_hier_level,
+                                 last_tested_hier_level, next_value,
+                                 next_element.as_ref(), parent_bf,
                                  shareable, stats);
 
         if result != EvaluationResult::Backtrack {
@@ -588,30 +723,49 @@ fn accepts<E>(state_idx: usize, nfa: &SelectorNFA,
 }
 
 pub fn matches_nfa_ref<E>(nfa: &SelectorNFA, element: &E,
+                          parent_bf: Option<&BloomFilter>,
                           shareable: &mut bool,
                           stats: &mut DebugStats)
                           -> bool where E: Element {
     let leaf_state_idx = 2;    // Index 2 is leaf
-    let result = accepts_ref(leaf_state_idx, nfa, InputValue::Leaf,
-                             Some(element), shareable, stats);
+
+    // Start hierarchy level 1 above the last tested level to make
+    // sure we test the first level
+    let hier_level = 1;
+    let mut last_tested_hier_level = 0;
+
+    let result = accepts_ref(leaf_state_idx, nfa, hier_level,
+                             &mut last_tested_hier_level, InputValue::Leaf,
+                             Some(element), parent_bf, shareable, stats);
+
     return result == EvaluationResult::Matched;
 }
 
 pub fn matches_nfa_opt<E>(nfa: &SelectorNFA, element: &E,
+                          parent_bf: Option<&BloomFilter>,
                           shareable: &mut bool,
                           stats: &mut DebugStats)
                           -> bool where E: Element {
     let leaf_state_idx = 2;    // Index 2 is leaf
-    let result = accepts(leaf_state_idx, nfa, InputValue::Leaf,
-                         Some(element), shareable, stats);
+
+    // Start hierarchy level 1 above the last tested level to make
+    // sure we test the first level
+    let hier_level = 1;
+    let mut last_tested_hier_level = 0;
+
+    let result = accepts_opt(leaf_state_idx, nfa, hier_level,
+                             &mut last_tested_hier_level, InputValue::Leaf,
+                             Some(element), parent_bf, shareable, stats);
+
     return result == EvaluationResult::Matched;
 }
 
 pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
+                      parent_bf: Option<&BloomFilter>,
                       shareable: &mut bool,
                       stats: &mut DebugStats)
                       -> bool where E: Element {
-    //return matches_nfa_ref(nfa, element, shareable, stats);
-    return matches_nfa_opt(nfa, element, shareable, stats);
+    //return matches_nfa_ref(nfa, element, parent_bf, shareable, stats);
+    return matches_nfa_opt(nfa, element, parent_bf, shareable, stats);
 }
 

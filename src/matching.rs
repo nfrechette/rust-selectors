@@ -221,16 +221,19 @@ impl<T> SelectorMap<T> {
 
             let mut shareable_nfa = *shareable;
 
+            // Test NFA first when pseudo-profiling since the cache won't
+            // be primed by the reference impl.
+
+            let result_nfa = nfa::matches_nfa(&*rule.nfa, element, parent_bf,
+                                              &mut shareable_nfa,
+                                              &mut debug_info.nfa_stats);
+
             let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
 
             if result {
                 debug_info.num_rules_matched += 1;
                 matching_rules.push(rule.declarations.clone());
             }
-
-            let result_nfa = nfa::matches_nfa(&*rule.nfa, element,
-                                              &mut shareable_nfa,
-                                              &mut debug_info.nfa_stats);
 
             let mut should_panic = false;
             if result != result_nfa {
@@ -480,9 +483,6 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
         return Some(SelectorMatchingResult::NotMatchedAndRestartFromClosestLaterSibling);
     }
 
-    // hack!
-    return None;
-/*
     let bf: &BloomFilter = match parent_bf {
         None => return None,
         Some(ref bf) => bf,
@@ -531,7 +531,6 @@ fn can_fast_reject<E>(mut selector: &CompoundSelector,
 
     // Can't fast reject.
     return None;
-*/
 }
 
 fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
