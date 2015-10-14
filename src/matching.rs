@@ -57,6 +57,7 @@ pub struct SelectorMap<T> {
 }
 
 //use std::hash::{Hash, Hasher, SipHasher};
+use std::cmp;
 
 pub struct DebugStats {
     pub selectors_elapsed_ns: usize,
@@ -81,6 +82,7 @@ impl DebugStats {
 
 pub struct DebugInfo {
     pub rules_elapsed_ns: usize,
+    pub rules_max_elapsed_ns: usize,
     pub num_rules_tested: usize,
     pub num_rules_matched: usize,
 
@@ -92,6 +94,7 @@ impl DebugInfo {
     pub fn new() -> DebugInfo {
         DebugInfo {
             rules_elapsed_ns: 0,
+            rules_max_elapsed_ns: 0,
             num_rules_tested: 0,
             num_rules_matched: 0,
             legacy_stats: DebugStats::new(),
@@ -178,6 +181,7 @@ impl<T> SelectorMap<T> {
         let et = stdtime::precise_time_ns();
         let elapsed = (et - st) as usize;
         debug_info.rules_elapsed_ns += elapsed;
+        debug_info.rules_max_elapsed_ns = cmp::max(debug_info.rules_max_elapsed_ns, elapsed);
 
         fn compare<T>(a: &DeclarationBlock<T>, b: &DeclarationBlock<T>) -> Ordering {
             (a.specificity, a.source_order).cmp(&(b.specificity, b.source_order))
@@ -218,22 +222,17 @@ impl<T> SelectorMap<T> {
         for rule in rules.iter() {
             //let st = stdtime::precise_time_ns();
             debug_info.num_rules_tested += 1;
-
-            let mut shareable_nfa = *shareable;
-
+/*
             // Test NFA first when pseudo-profiling since the cache won't
             // be primed by the reference impl.
+
+            let mut shareable_nfa = *shareable;
 
             let result_nfa = nfa::matches_nfa(&*rule.nfa, element, parent_bf,
                                               &mut shareable_nfa,
                                               &mut debug_info.nfa_stats);
 
             let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
-
-            if result {
-                debug_info.num_rules_matched += 1;
-                matching_rules.push(rule.declarations.clone());
-            }
 
             let mut should_panic = false;
             if result != result_nfa {
@@ -254,6 +253,20 @@ impl<T> SelectorMap<T> {
             }
 
             if should_panic { panic!(); }
+*/
+
+
+            let result = nfa::matches_nfa(&*rule.nfa, element, parent_bf,
+                                              shareable,
+                                              &mut debug_info.nfa_stats);
+
+/*
+            let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
+*/
+            if result {
+                debug_info.num_rules_matched += 1;
+                matching_rules.push(rule.declarations.clone());
+            }
 
             //let et = stdtime::precise_time_ns();
             //let elapsed = (et - st) as usize;
