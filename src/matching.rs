@@ -64,6 +64,8 @@ pub struct DebugStats {
     pub num_selectors_tested: usize,
     pub num_selectors_matched: usize,
 
+    pub num_fn_calls: usize,
+
     pub per_type_tested: HashMap<u64, usize>,
     pub per_type_matched: HashMap<u64, usize>,
 }
@@ -74,6 +76,7 @@ impl DebugStats {
             selectors_elapsed_ns: 0,
             num_selectors_tested: 0,
             num_selectors_matched: 0,
+            num_fn_calls: 0,
             per_type_tested: hash_map::new(),
             per_type_matched: hash_map::new(),
         }
@@ -131,8 +134,6 @@ impl<T> SelectorMap<T> {
             return
         }
 
-        let st = stdtime::precise_time_ns();
-
         // At the end, we're going to sort the rules that we added, so remember where we began.
         let init_len = matching_rules_list.len();
         if let Some(id) = element.get_id() {
@@ -178,11 +179,6 @@ impl<T> SelectorMap<T> {
         // Sort only the rules we just added.
         sort_by(&mut matching_rules_list[init_len..], &compare);
 
-        let et = stdtime::precise_time_ns();
-        let elapsed = (et - st) as usize;
-        debug_info.rules_elapsed_ns += elapsed;
-        debug_info.rules_max_elapsed_ns = cmp::max(debug_info.rules_max_elapsed_ns, elapsed);
-
         fn compare<T>(a: &DeclarationBlock<T>, b: &DeclarationBlock<T>) -> Ordering {
             (a.specificity, a.source_order).cmp(&(b.specificity, b.source_order))
         }
@@ -222,10 +218,12 @@ impl<T> SelectorMap<T> {
         for rule in rules.iter() {
             //let st = stdtime::precise_time_ns();
             debug_info.num_rules_tested += 1;
-/*
+
+            let st = stdtime::precise_time_ns();
+
             // Test NFA first when pseudo-profiling since the cache won't
             // be primed by the reference impl.
-
+/*
             let mut shareable_nfa = *shareable;
 
             let result_nfa = nfa::matches_nfa(&*rule.nfa, element, parent_bf,
@@ -251,22 +249,39 @@ impl<T> SelectorMap<T> {
                 println!("Ref/NFA matched: {}/{}", debug_info.legacy_stats.num_selectors_matched, debug_info.nfa_stats.num_selectors_matched);
                 should_panic = true;
             }
+            if debug_info.legacy_stats.num_fn_calls != debug_info.nfa_stats.num_fn_calls {
+                println!("Ref/NFA calls: {}/{}", debug_info.legacy_stats.num_fn_calls, debug_info.nfa_stats.num_fn_calls);
+                should_panic = true;
+            }
 
-            if should_panic { panic!(); }
+            if should_panic {
+                println!("---> Rule: '{}'", nfa::to_string(&*rule.nfa));
+                panic!();
+            }
 */
 
-
             let result = nfa::matches_nfa(&*rule.nfa, element, parent_bf,
-                                              shareable,
-                                              &mut debug_info.nfa_stats);
+                                          shareable, &mut debug_info.nfa_stats);
 
 /*
             let result = matches_compound_selector(&*rule.selector, element, parent_bf, shareable, &mut debug_info.legacy_stats);
 */
+
+            let et = stdtime::precise_time_ns();
+
             if result {
                 debug_info.num_rules_matched += 1;
                 matching_rules.push(rule.declarations.clone());
             }
+
+            let elapsed = (et - st) as usize;
+            debug_info.rules_elapsed_ns += elapsed;
+/*
+            if elapsed > debug_info.rules_max_elapsed_ns {
+                println!("---> Max rule: '{}' @ {} ns", nfa::to_string(&*rule.nfa), elapsed);
+            }
+*/
+            debug_info.rules_max_elapsed_ns = cmp::max(debug_info.rules_max_elapsed_ns, elapsed);
 
             //let et = stdtime::precise_time_ns();
             //let elapsed = (et - st) as usize;
@@ -553,6 +568,7 @@ fn matches_compound_selector_internal<E>(selector: &CompoundSelector,
                                          stats: &mut DebugStats)
                                          -> SelectorMatchingResult
                                          where E: Element {
+    stats.num_fn_calls += 1;
     if let Some(result) = can_fast_reject(selector, element, parent_bf, shareable, stats) {
         return result;
     }
