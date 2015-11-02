@@ -7,7 +7,6 @@ extern crate time as stdtime;
 use parser::{CompoundSelector, Combinator, SimpleSelector, LocalName};
 use matching::{self, DebugStats};
 use tree::Element;
-use std::collections::HashMap;
 use bloom::BloomFilter;
 
 // Our alphabet is:
@@ -94,114 +93,204 @@ use bloom::BloomFilter;
 //                  skip prev next sibling selector (+)
 //                  if no prev selector, failure
 
-#[derive(Eq, PartialEq, Clone, Hash, Debug)]
+#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
 pub enum State {
-    Leaf(Vec<SimpleSelector>),
-    Child(Vec<SimpleSelector>),
-    Descendant(Vec<SimpleSelector>),
-    NextSibling(Vec<SimpleSelector>),
-    LaterSibling(Vec<SimpleSelector>),
     Matched,
     Failed,
+    Leaf,
+    Child,
+    Descendant,
+    NextSibling,
+    LaterSibling,
 }
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
 pub enum Symbol {
     Matched,
     NotMatched,
-    Epsilon,
-    EndOfStream,
 }
 
-fn get_symbol_index(symbol: Symbol) -> usize {
-    match symbol {
-        Symbol::Matched =>      0,
-        Symbol::NotMatched =>   1,
-        Symbol::Epsilon =>      2,
-        Symbol::EndOfStream =>  3,
-    }
+#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
+enum Direction {
+    Parent,
+    Sibling,
 }
 
-static NUM_SYMBOLS: usize = 4;
+#[derive(PartialEq, Clone, Debug)]
+pub struct StateInfo {
+    state: State,
+    direction: Direction,       // Which direction we iterate
+    backtrack_distance: usize,  // How far to backtrack on failure
+    first_selector_idx: usize,
+    num_selectors: usize,
+}
 
 #[derive(PartialEq, Clone, Debug)]
 pub struct SelectorNFA {
-    // Store the list of NFA states including the simple selectors (copied)
-    pub state_list: Vec<State>,
+    pub state_list: Vec<StateInfo>,
+    pub selector_list: Vec<SimpleSelector>,
+}
 
-    // Simple transition map: (current state idx, symbol) -> next state idx list
-    pub transition_map: HashMap<(usize, Symbol), Vec<usize>>,
+fn get_direction(state: State) -> Direction {
+    match state {
+        State::Child |
+        State::Descendant => Direction::Parent,
+        _ => Direction::Sibling,
+    }
+}
 
-    // Compact transition map:
-    // Each transition leads to at most 2 states, a new state and the current
-    // state (epsilon transition). We use a u8 to store this. If the MSB is
-    // set, we have an epsilon transition otherwise we do not. The rest of
-    // the bits store the next state index. 7 bits allow for 128 states.
-    // The size of the array is Num States * Num Symbols
-    pub compact_transition_map: Vec<u8>,
+#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
+enum BacktrackTarget {
+    ClosestLaterSibling,
+    ClosestDescendant,
+}
+
+fn get_backtrack_distance(state: State,
+                          state_list: &Vec<StateInfo>)
+                          -> usize {
+    // We should always have at least our 2 artificial states
+    if state_list.len() <= 2 { panic!(); }
+
+    // Backtracking works by going back up 1 level on the evaluation stack
+    // When a state fails a match for a node, we need to backtrack to
+    // try either a different node for the same state (or a previous state
+    // further up)
+    // Thus, states that can skip nodes when a match fails (descendant, later
+    // sibling) backtrack by 1 to try the next node and other states
+    // need to backtrack by 2+ to try a previous state on a new node.
+
+    let mut target = match state {
+        // First two states are special artificial states
+        State::Matched |
+        State::Failed => panic!(),
+        // If our leaf fails, we backtrack to the failed state
+        State::Leaf => return 1,
+        // If child fails, we backtrack looking for a previous descendant state
+        State::Child => BacktrackTarget::ClosestDescendant,
+        // If descendant fails, we backtrack once to try the next parent
+        State::Descendant => return 1,
+        // If next sibling fails, we backtrack looking for a previous later
+        // sibling state
+        State::NextSibling => BacktrackTarget::ClosestLaterSibling,
+        // If later sibling fails, we backtrack once to try the next sibling
+        State::LaterSibling => return 1,
+    };
+
+    // We need to try a previous state, thus at least twice
+    let mut distance = 2;
+
+    for info in state_list[2 .. state_list.len()].iter().rev() {
+        match (target, info.state) {
+            // If we meet a child node, we upgrade our search to the closest
+            // descendant
+            (_, State::Child) => {
+                target = BacktrackTarget::ClosestDescendant;
+            },
+            // Keep whatever search target we had
+            (_, State::NextSibling) => {}
+            // Keep our closest descendant search target
+            (BacktrackTarget::ClosestDescendant, State::LaterSibling) => {}
+            // We hit our target state, stop
+            _ => break,
+        }
+
+        distance += 1;
+    }
+
+    return distance;
 }
 
 fn get_states_internal(selector: &CompoundSelector,
-                       state_list: &mut Vec<State>) {
+                       state_list: &mut Vec<StateInfo>,
+                       selector_list: &mut Vec<SimpleSelector>) {
 
-    let state = match selector.next {
+    let (state, ref selectors) = match selector.next {
         None => return,
         Some((ref next_selector, Combinator::Child))
-            => State::Child(next_selector.simple_selectors.to_vec()),
+            => (State::Child, &next_selector.simple_selectors),
         Some((ref next_selector, Combinator::Descendant))
-            => State::Descendant(next_selector.simple_selectors.to_vec()),
+            => (State::Descendant, &next_selector.simple_selectors),
         Some((ref next_selector, Combinator::NextSibling))
-            => State::NextSibling(next_selector.simple_selectors.to_vec()),
+            => (State::NextSibling, &next_selector.simple_selectors),
         Some((ref next_selector, Combinator::LaterSibling))
-            => State::LaterSibling(next_selector.simple_selectors.to_vec()),
+            => (State::LaterSibling, &next_selector.simple_selectors),
     };
 
-    state_list.push(state);
+    let first_idx = selector_list.len();
+    selector_list.extend(selectors.iter().cloned());
+
+    let distance = get_backtrack_distance(state, state_list);
+
+    let info = StateInfo {
+        state: state,
+        direction: get_direction(state),
+        backtrack_distance: distance,
+        first_selector_idx: first_idx,
+        num_selectors: selectors.len(),
+    };
+
+    state_list.push(info);
 
     match selector.next {
         None => return,
-        Some((ref next, _)) => get_states_internal(&**next, state_list),
+        Some((ref next, _)) => get_states_internal(&**next, state_list,
+                                                   selector_list),
     };
 }
 
-fn get_states(selector: &CompoundSelector) -> Vec<State> {
+fn get_states(selector: &CompoundSelector)
+              -> (Vec<StateInfo>, Vec<SimpleSelector>) {
     let mut state_list = vec!();
+    let mut selector_list = vec!();
 
-    state_list.push(State::Matched);
-    state_list.push(State::Failed);
-    state_list.push(State::Leaf(selector.simple_selectors.to_vec()));
+    selector_list.extend(selector.simple_selectors.iter().cloned());
 
-    get_states_internal(selector, &mut state_list);
+    state_list.push(StateInfo {
+        state: State::Matched,
+        direction: Direction::Parent,
+        backtrack_distance: !0,
+        first_selector_idx: !0,
+        num_selectors: !0,
+    });
+    state_list.push(StateInfo {
+        state: State::Failed,
+        direction: Direction::Parent,
+        backtrack_distance: !0,
+        first_selector_idx: !0,
+        num_selectors: !0,
+    });
+    state_list.push(StateInfo {
+        state: State::Leaf,
+        direction: Direction::Parent,
+        backtrack_distance: 1,
+        first_selector_idx: 0,
+        num_selectors: selector.simple_selectors.len(),
+    });
 
-    return state_list;
+    get_states_internal(selector, &mut state_list, &mut selector_list);
+
+    return (state_list, selector_list);
 }
 
-fn get_next_state_idx(idx: usize, state_list: &Vec<State>) -> usize {
-    if idx + 1 >= state_list.len() {
-        return 0;  // Index 0 is Matched
-    }
-    else {
-        return idx + 1;
-    }
-}
-
-pub fn to_string(state_list: &Vec<State>) -> String {
+pub fn to_string(nfa: &SelectorNFA) -> String {
     let mut result = String::new();
-    for state in state_list.iter() {
-        match state {
-            &State::Leaf(..) => { result.push_str("$"); }
-            &State::Child(..) => { result.push_str(">"); }
-            &State::Descendant(..) => { result.push_str(" "); }
-            &State::NextSibling(..) => { result.push_str("+"); }
-            &State::LaterSibling(..) => { result.push_str("~"); }
+    for info in nfa.state_list.iter() {
+        let dist = info.backtrack_distance;
+        match info.state {
+            State::Leaf => { result.push_str(&format!("$ ({})", dist)); }
+            State::Child => { result.push_str(&format!("> ({})", dist)); }
+            State::Descendant => { result.push_str(&format!("_ ({})", dist)); }
+            State::NextSibling => { result.push_str(&format!("+ ({})", dist)); }
+            State::LaterSibling => { result.push_str(&format!("~ ({})", dist)); }
             _ => {}
         };
     }
     return result;
 }
 
+/*
 fn build_transition_map(state_list: &Vec<State>)
-                        -> HashMap<(usize, Symbol), Vec<usize>> {
+                        -> HashMap<(usize, Symbol), usize> {
 
     let mut map = HashMap::new();
 
@@ -213,39 +302,41 @@ fn build_transition_map(state_list: &Vec<State>)
         match state {
             &State::Leaf(..) => {
                 // If we match, move on to the next state
-                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                map.insert((state_idx, Symbol::Matched), next_state_idx);
                 // If we do not match, we failed and can never match
-                map.insert((state_idx, Symbol::NotMatched), vec![failed_idx]);
+                map.insert((state_idx, Symbol::NotMatched), failed_idx);
                 // No epsilon transitions for leaf state
                 // No end of stream for leaf state since we always at least
                 // have a root node
             }
             &State::Child(..) => {
                 // If we match, move on to the next state
-                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                map.insert((state_idx, Symbol::Matched), next_state_idx);
                 // If we do not match, we backtrack to a previous state
                 // If we hit a sibling node, we skip it
-                map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                //map.insert((state_idx, Symbol::Epsilon),
+                //           (!0, true));
                 // If we reach the end of the parent nodes,
                 // matching will never happen
-                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
+                //map.insert((state_idx, Symbol::EndOfStream), failed_idx);
             }
             &State::Descendant(..) => {
                 // If we match, we try the next state and retry with the
                 // next node if the next state fails and backtracks
-                map.insert((state_idx, Symbol::Matched),
-                           vec![next_state_idx, state_idx]);
+                map.insert((state_idx, Symbol::Matched), next_state_idx);
                 // If we don't match, we skip the node
-                map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
+                //map.insert((state_idx, Symbol::NotMatched),
+                //           (!0, true));
                 // If we hit a sibling node, we skip it
-                map.insert((state_idx, Symbol::Epsilon), vec![state_idx]);
+                //map.insert((state_idx, Symbol::Epsilon),
+                //           (!0, true));
                 // If we reach the end of the parent nodes,
                 // matching will never happen
-                map.insert((state_idx, Symbol::EndOfStream), vec![failed_idx]);
+                //map.insert((state_idx, Symbol::EndOfStream), failed_idx);
             }
             &State::NextSibling(..) => {
                 // If we match, move on to the next state
-                map.insert((state_idx, Symbol::Matched), vec![next_state_idx]);
+                map.insert((state_idx, Symbol::Matched), next_state_idx);
                 // If we do not match, we backtrack to a previous state
                 // No epsilon transition for next sibling state
                 // If we reach the end of the sibling nodes, we backtrack
@@ -253,10 +344,10 @@ fn build_transition_map(state_list: &Vec<State>)
             &State::LaterSibling(..) => {
                 // If we match, we try the next state and retry with the
                 // next node if the next state fails and backtracks
-                map.insert((state_idx, Symbol::Matched),
-                           vec![next_state_idx, state_idx]);
+                map.insert((state_idx, Symbol::Matched), next_state_idx);
                 // If we don't match, we skip the node
-                map.insert((state_idx, Symbol::NotMatched), vec![state_idx]);
+                //map.insert((state_idx, Symbol::NotMatched),
+                //           (!0, true));
                 // No epsilon transition for later sibling state
                 // If we reach the end of the sibling nodes, we backtrack
             }
@@ -267,93 +358,18 @@ fn build_transition_map(state_list: &Vec<State>)
     }
 
     //println!("DEBUG CSS RULE: [{}]", to_string(state_list));
-/*
-    // Prune epsilon transitions for early-out conditions
-    for (state_idx, state) in state_list.iter().enumerate() {
-        match state {
-            &State::LaterSibling(..) => {
-                let mut cursor_idx = state_idx + 1;
-                while cursor_idx < state_list.len() {
-                    match &state_list[cursor_idx] {
-                        &State::NextSibling(..) => { cursor_idx += 1; }
-                        _ => { break; }
-                    };
-                }
-
-                if cursor_idx < state_list.len() {
-                    match &state_list[cursor_idx] {
-                        &State::Child(..) => {
-                            println!("Early out from child at {}. [{}]", cursor_idx, to_string(state_list));
-                            let cursor_idx = cursor_idx as u32;
-                            let ls = map.get_mut(&(cursor_idx, Symbol::Matched));
-                            ls.unwrap().pop();
-                        }
-                        _ => {}
-                    };
-                }
-            }
-            _ => {}
-        };
-    }
-*/
 
     return map;
 }
-
-fn build_compact_transition_map(state_list: &Vec<State>,
-                        transition_map: &HashMap<(usize, Symbol), Vec<usize>>)
-                        -> Vec<u8> {
-    // TODO: Right now we panic if we have too many states, in practice
-    // we would want to detect this and fallback to the reference impl.
-    if state_list.len() > 128 { panic!(); }
-
-    let compact_map_size = state_list.len() * NUM_SYMBOLS;
-    let mut compact_map = vec![!0u8; compact_map_size];
-
-    let symbols = [Symbol::Matched, Symbol::NotMatched,
-                   Symbol::Epsilon, Symbol::EndOfStream];
-
-    for (state_idx, _) in state_list.iter().enumerate() {
-        for symbol in symbols.iter() {
-            let symbol_idx = get_symbol_index(*symbol);
-            let map_idx = (state_idx * NUM_SYMBOLS) + symbol_idx;
-            let key = (state_idx, *symbol);
-
-            let transitions = transition_map.get(&key);
-            let transition = match transitions {
-                None => !0u8,
-                Some(transitions) => {
-                    let mut transition = transitions[0] as u8;
-                    if transitions.len() > 1 {
-                        // TODO: Convert to asserts?
-                        if transitions.len() > 2 { panic!(); }
-                        if transitions[1] != state_idx { panic!(); }
-
-                        // Epsilon transition
-                        transition |= 1 << 7;
-                    }
-                    transition
-                },
-            };
-
-            compact_map[map_idx] = transition;
-        }
-    }
-
-    return compact_map;
-}
+*/
 
 pub fn build_nfa(selector: &CompoundSelector) -> SelectorNFA {
 
-    let state_list = get_states(selector);
-
-    let map = build_transition_map(&state_list);
-    let compact_map = build_compact_transition_map(&state_list, &map);
+    let (state_list, selector_list) = get_states(selector);
 
     return SelectorNFA {
         state_list: state_list,
-        transition_map: map,
-        compact_transition_map: compact_map,
+        selector_list: selector_list,
     };
 }
 
@@ -389,36 +405,36 @@ fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
         return false;
     }
 
-    for next_state_idx in state_idx + 1 .. nfa.state_list.len() {
-        let ref state = nfa.state_list[next_state_idx];
+    for next_state_idx in (state_idx + 1) .. nfa.state_list.len() {
+        let ref info = nfa.state_list[next_state_idx];
 
         // TODO: See if we should test child states as well? Original impl
         // doesn't but is that correct?
 
-        let ref simple_selectors = match state {
-            &State::Descendant(ref simple_selectors) => simple_selectors,
-            _ => continue,
-        };
+        if info.state != State::Descendant { continue; }
 
-        for ss in simple_selectors.iter() {
-            match *ss {
-                SimpleSelector::LocalName(LocalName { ref name, ref lower_name }) => {
+        let start_idx = info.first_selector_idx;
+        let end_idx = start_idx + info.num_selectors;
+
+        for ss in &nfa.selector_list[start_idx .. end_idx] {
+            match ss {
+                &SimpleSelector::LocalName(LocalName { ref name, ref lower_name }) => {
                     if !bf.might_contain(name)
                     && !bf.might_contain(lower_name) {
                         return true;
                     }
                 },
-                SimpleSelector::Namespace(ref namespace) => {
+                &SimpleSelector::Namespace(ref namespace) => {
                     if !bf.might_contain(namespace) {
                         return true;
                     }
                 },
-                SimpleSelector::ID(ref id) => {
+                &SimpleSelector::ID(ref id) => {
                     if !bf.might_contain(id) {
                         return true;
                     }
                 },
-                SimpleSelector::Class(ref class) => {
+                &SimpleSelector::Class(ref class) => {
                     if !bf.might_contain(class) {
                         return true;
                     }
@@ -435,17 +451,8 @@ fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
     return false;
 }
 
-#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
-enum InputValue {
-    Parent,
-    Sibling,
-    Leaf,
-}
-
-fn eval_selectors<E>(state_idx: usize, nfa: &SelectorNFA,
-                     hier_level: usize,
-                     last_tested_hier_level: &mut usize,
-                     element: &E, parent_bf: Option<&BloomFilter>,
+#[inline(never)]
+fn eval_selectors<E>(element: &E,
                      simple_selectors: &[SimpleSelector],
                      shareable: &mut bool, stats: &mut DebugStats)
                 -> Symbol where E: Element {
@@ -457,307 +464,103 @@ fn eval_selectors<E>(state_idx: usize, nfa: &SelectorNFA,
         return Symbol::NotMatched;
     }
 
-    if is_rejected_by_bloom_filter(state_idx, nfa, parent_bf,
-                                   hier_level, last_tested_hier_level) {
-        // If the bloom filter rejects our descendant selectors, simulate
-        // the end of the stream since we can never match
-        return Symbol::EndOfStream;
-    }
-
     return Symbol::Matched;
 }
 
-fn eval_leaf<E>(state_idx: usize, nfa: &SelectorNFA,
-                hier_level: usize,
-                last_tested_hier_level: &mut usize,
-                input_value: InputValue, element: Option<&E>,
-                parent_bf: Option<&BloomFilter>,
-                simple_selectors: &[SimpleSelector],
-                shareable: &mut bool, stats: &mut DebugStats)
-            -> Symbol where E: Element {
-    let element = match element {
-        None => panic!(),
-        Some(e) => e,
-    };
-    match input_value {
-        InputValue::Parent => panic!(),
-        InputValue::Sibling => panic!(),
-        InputValue::Leaf => eval_selectors(state_idx, nfa, hier_level,
-                                           last_tested_hier_level,
-                                           element, parent_bf,
-                                           simple_selectors,
-                                           shareable, stats),
-    }
-}
-
-fn eval_descendant<E>(state_idx: usize, nfa: &SelectorNFA,
-                      hier_level: usize,
-                      last_tested_hier_level: &mut usize,
-                      input_value: InputValue, element: Option<&E>,
-                      parent_bf: Option<&BloomFilter>,
-                      simple_selectors: &[SimpleSelector],
-                      shareable: &mut bool, stats: &mut DebugStats)
-                   -> Symbol where E: Element {
-    let element = match element {
-        None => return Symbol::EndOfStream,
-        Some(e) => e,
-    };
-    match input_value {
-        InputValue::Parent => eval_selectors(state_idx, nfa, hier_level,
-                                             last_tested_hier_level,
-                                             element, parent_bf,
-                                             simple_selectors,
-                                             shareable, stats),
-        InputValue::Sibling => Symbol::Epsilon,
-        InputValue::Leaf => panic!(),
-    }
-}
-
-fn eval_sibling<E>(state_idx: usize, nfa: &SelectorNFA,
-                   hier_level: usize,
-                   last_tested_hier_level: &mut usize,
-                   input_value: InputValue, element: Option<&E>,
-                   parent_bf: Option<&BloomFilter>,
-                   simple_selectors: &[SimpleSelector],
-                   shareable: &mut bool, stats: &mut DebugStats)
-                -> Symbol where E: Element {
-    let element = match element {
-        None => return Symbol::EndOfStream,
-        Some(e) => e,
-    };
-    match input_value {
-        InputValue::Parent => Symbol::EndOfStream,
-        InputValue::Sibling => eval_selectors(state_idx, nfa, hier_level,
-                                              last_tested_hier_level,
-                                              element, parent_bf,
-                                              simple_selectors,
-                                              shareable, stats),
-        InputValue::Leaf => panic!(),
-    }
-}
-
-fn get_symbol<E>(state_idx: usize, nfa: &SelectorNFA,
-                 hier_level: usize,
-                 last_tested_hier_level: &mut usize,
-                 input_value: InputValue, element: Option<&E>,
-                 parent_bf: Option<&BloomFilter>,
+#[inline]
+fn get_symbol<E>(info: &StateInfo, nfa: &SelectorNFA, element: &E,
                  shareable: &mut bool, stats: &mut DebugStats)
                  -> Symbol where E: Element {
-    let ref state = nfa.state_list[state_idx];
 
-    match state {
-        &State::Leaf(ref simple_selectors) =>
-            eval_leaf(state_idx, nfa, hier_level,
-                      last_tested_hier_level, input_value, element,
-                      parent_bf, simple_selectors, shareable, stats),
-        &State::Child(ref simple_selectors) |
-        &State::Descendant(ref simple_selectors) =>
-            eval_descendant(state_idx, nfa, hier_level,
-                            last_tested_hier_level, input_value, element,
-                            parent_bf, simple_selectors, shareable, stats),
-        &State::NextSibling(ref simple_selectors) |
-        &State::LaterSibling(ref simple_selectors) =>
-            eval_sibling(state_idx, nfa, hier_level,
-                         last_tested_hier_level, input_value, element,
-                         parent_bf, simple_selectors, shareable, stats),
-        _ => panic!(),
-    }
+    let start_idx = info.first_selector_idx;
+    let end_idx = start_idx + info.num_selectors;
+
+    eval_selectors(element, &nfa.selector_list[start_idx .. end_idx],
+                   shareable, stats)
 }
 
-#[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
-enum EvaluationResult {
-    Matched,
-    NotMatched,
-    Backtrack,
+#[inline]
+fn get_matched_backtrack_distance(state_idx: usize) -> usize {
+    // Matched is index 0
+    return state_idx - 0;
 }
 
-fn accepts_ref<E>(state_idx: usize, nfa: &SelectorNFA,
-                  hier_level: usize, last_tested_hier_level: &mut usize,
-                  input_value: InputValue, element: Option<&E>,
-                  parent_bf: Option<&BloomFilter>,
-                  shareable: &mut bool, stats: &mut DebugStats)
-                  -> EvaluationResult where E: Element {
-    let ref state = nfa.state_list[state_idx];
+#[inline]
+fn get_not_matched_backtrack_distance(state_idx: usize) -> usize {
+    // Failed is index 1
+    return state_idx - 1;
+}
 
-    // Check if we are a final accepting state
-    match state {
-        &State::Matched => return EvaluationResult::Matched,
-        &State::Failed => return EvaluationResult::NotMatched,
-        _ => {}
-    };
+fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
+                 mut hier_level: usize, last_tested_hier_level: &mut usize,
+                 element: &E,
+                 parent_bf: Option<&BloomFilter>,
+                 shareable: &mut bool, stats: &mut DebugStats)
+                 -> usize where E: Element {
+
+    stats.num_fn_calls += 1;
+
+    let ref info = nfa.state_list[state_idx];
 
     // Convert our input element into a symbol
-    let symbol = get_symbol(state_idx, nfa,
-                            hier_level, last_tested_hier_level,
-                            input_value, element, parent_bf,
-                            shareable, stats);
+    let symbol = get_symbol(&info, nfa, element, shareable, stats);
 
-    // Look up our possible transitions and try them
-    let transitions = nfa.transition_map.get(&(state_idx, symbol));
-
-    match transitions {
-        None => {},
-        Some(transitions) => {
-            let mut next_element = element.map_or(None, |e| e.prev_sibling_element());
-            let mut next_value = InputValue::Sibling;
-            let mut next_hier_level = hier_level;
-            if next_element.is_none() {
-                next_element = element.map_or(None, |e| e.parent_element());
-                next_value = InputValue::Parent;
-                next_hier_level += 1;
+    let next_state_idx = match symbol {
+        Symbol::Matched => {
+            if is_rejected_by_bloom_filter(state_idx, nfa, parent_bf,
+                                   hier_level, last_tested_hier_level) {
+                // If the bloom filter rejects our descendant selectors,
+                // we can never match
+                return get_not_matched_backtrack_distance(state_idx);
             }
-
-            for next_state in transitions.iter() {
-                let result = accepts_ref(*next_state, nfa, next_hier_level,
-                                         last_tested_hier_level,
-                                         next_value,
-                                         next_element.as_ref(), parent_bf,
-                                         shareable, stats);
-
-                if result != EvaluationResult::Backtrack {
-                    // If we aren't backtracking, return
-                    return result;
-                }
+            if state_idx + 1 >= nfa.state_list.len() {
+                // We fully matched
+                return get_matched_backtrack_distance(state_idx);
             }
-        }
+            state_idx + 1
+        },
+        // Back track
+        Symbol::NotMatched => return info.backtrack_distance,
     };
 
-    // If we didn't find a transition or if they all asked to backtrack,
-    // we backtrack
-    return EvaluationResult::Backtrack;
-}
+    let ref next_info = nfa.state_list[next_state_idx];
 
-fn needs_parent(state_idx: usize, nfa: &SelectorNFA) -> bool {
-    let ref state = nfa.state_list[state_idx];
-    match state {
-        &State::Child(..) |
-        &State::Descendant(..) => true,
-        _ => false,
-    }
-}
-
-fn accepts_opt<E>(state_idx: usize, nfa: &SelectorNFA,
-                  hier_level: usize, last_tested_hier_level: &mut usize,
-                  input_value: InputValue, element: Option<&E>,
-                  parent_bf: Option<&BloomFilter>,
-                  shareable: &mut bool, stats: &mut DebugStats)
-              -> EvaluationResult where E: Element {
-    let ref state = nfa.state_list[state_idx];
-
-    // Check if we are a final accepting state
-    match state {
-        &State::Matched => return EvaluationResult::Matched,
-        &State::Failed => return EvaluationResult::NotMatched,
-        _ => {}
+    let mut next_element = match next_info.direction {
+        Direction::Parent => {
+            hier_level += 1;
+            element.parent_element()
+        },
+        Direction::Sibling => element.prev_sibling_element(),
     };
 
-    // Convert our input element into a symbol
-    let symbol = get_symbol(state_idx, nfa,
-                            hier_level, last_tested_hier_level,
-                            input_value, element, parent_bf,
-                            shareable, stats);
+    let end_of_stream_distance = match next_info.direction {
+        Direction::Parent => get_not_matched_backtrack_distance(state_idx),
+        Direction::Sibling => info.backtrack_distance,
+    };
 
-    // Look up our possible transitions and try them
-    let symbol_idx = get_symbol_index(symbol);
-    let transition_idx = (state_idx * NUM_SYMBOLS) + symbol_idx;
-    let transitions = nfa.compact_transition_map[transition_idx];
-
-    if transitions == !0 {
-        // No transitions, backtrack!
-        return EvaluationResult::Backtrack;
-    }
-
-    // Try our next state first
-    {
-        let next_state_idx = (transitions & !(1 << 7)) as usize;
-        let needs_parent = needs_parent(next_state_idx, nfa);
-        let (next_element, next_value, next_hier_level) = if needs_parent {
-            (element.map_or(None, |e| e.parent_element()),
-             InputValue::Parent, hier_level + 1)
-        } else {
-            (element.map_or(None, |e| e.prev_sibling_element()),
-             InputValue::Sibling, hier_level)
+    loop {
+        let element = match next_element {
+            None => return end_of_stream_distance,
+            Some(e) => e,
         };
 
-        let result = accepts_opt(next_state_idx, nfa, next_hier_level,
-                                 last_tested_hier_level, next_value,
-                                 next_element.as_ref(), parent_bf,
-                                 shareable, stats);
+        // Try our next state with the next element
+        let distance = eval_state(next_state_idx, nfa,
+                                  hier_level,
+                                  last_tested_hier_level,
+                                  &element, parent_bf,
+                                  shareable, stats);
 
-        if result != EvaluationResult::Backtrack {
-            // If we aren't backtracking, return
-            return result;
-        }
-    }
+        if distance > 1 { return distance - 1; }
 
-    if (transitions & (1 << 7)) == 0 {
-        // No epsilon transition and our next state transition backtracked
-        return EvaluationResult::Backtrack;
-    }
-
-    // Now try the epsilon transition to our current state
-    {
-        let next_state_idx = state_idx;
-        let needs_parent = needs_parent(next_state_idx, nfa);
-        let (next_element, next_value, next_hier_level) = if needs_parent {
-            (element.map_or(None, |e| e.parent_element()),
-             InputValue::Parent, hier_level + 1)
-        } else {
-            (element.map_or(None, |e| e.prev_sibling_element()),
-             InputValue::Sibling, hier_level)
+        next_element = match next_info.direction {
+            Direction::Parent => {
+                hier_level += 1;
+                element.parent_element()
+            },
+            Direction::Sibling => element.prev_sibling_element(),
         };
-
-        let result = accepts_opt(next_state_idx, nfa, next_hier_level,
-                                 last_tested_hier_level, next_value,
-                                 next_element.as_ref(), parent_bf,
-                                 shareable, stats);
-
-        if result != EvaluationResult::Backtrack {
-            // If we aren't backtracking, return
-            return result;
-        }
     }
-
-    // Everything backtracked, we backtrack
-    return EvaluationResult::Backtrack;
-}
-
-pub fn matches_nfa_ref<E>(nfa: &SelectorNFA, element: &E,
-                          parent_bf: Option<&BloomFilter>,
-                          shareable: &mut bool,
-                          stats: &mut DebugStats)
-                          -> bool where E: Element {
-    let leaf_state_idx = 2;    // Index 2 is leaf
-
-    // Start hierarchy level 1 above the last tested level to make
-    // sure we test the first level
-    let hier_level = 1;
-    let mut last_tested_hier_level = 0;
-
-    let result = accepts_ref(leaf_state_idx, nfa, hier_level,
-                             &mut last_tested_hier_level, InputValue::Leaf,
-                             Some(element), parent_bf, shareable, stats);
-
-    return result == EvaluationResult::Matched;
-}
-
-pub fn matches_nfa_opt<E>(nfa: &SelectorNFA, element: &E,
-                          parent_bf: Option<&BloomFilter>,
-                          shareable: &mut bool,
-                          stats: &mut DebugStats)
-                          -> bool where E: Element {
-    let leaf_state_idx = 2;    // Index 2 is leaf
-
-    // Start hierarchy level 1 above the last tested level to make
-    // sure we test the first level
-    let hier_level = 1;
-    let mut last_tested_hier_level = 0;
-
-    let result = accepts_opt(leaf_state_idx, nfa, hier_level,
-                             &mut last_tested_hier_level, InputValue::Leaf,
-                             Some(element), parent_bf, shareable, stats);
-
-    return result == EvaluationResult::Matched;
 }
 
 pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
@@ -765,7 +568,27 @@ pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
                       shareable: &mut bool,
                       stats: &mut DebugStats)
                       -> bool where E: Element {
-    //return matches_nfa_ref(nfa, element, parent_bf, shareable, stats);
-    return matches_nfa_opt(nfa, element, parent_bf, shareable, stats);
+
+    // TODO: Move the bloom filter test after our leaf test
+    // If our leaf matches and we should test the bloom filter (add flag),
+    // test it once. No point in testing it every time.
+    // This means we need to move out the leaf test separaretly.
+
+    let leaf_state_idx = 2;    // Index 2 is leaf
+
+    // Start hierarchy level 1 above the last tested level to make
+    // sure we test the first level
+    let hier_level = 1;
+    let mut last_tested_hier_level = 0;
+
+    let distance = eval_state(leaf_state_idx, nfa, hier_level,
+                              &mut last_tested_hier_level,
+                              element, parent_bf, shareable, stats);
+
+    // If we backtrack this far, it means we are backtracking towards one
+    // of our 2 artificial states. Index 0 is Matched and Index 1 is Failed.
+    // Thus if at the leaf our backtrack distance is 2, we are matched and
+    // if it is 1, we failed. The distance cannot be any other value here.
+    return distance == 2;
 }
 
