@@ -94,7 +94,7 @@ use bloom::BloomFilter;
 //                  if no prev selector, failure
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
-pub enum State {
+enum State {
     Matched,
     Failed,
     Leaf,
@@ -105,7 +105,7 @@ pub enum State {
 }
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
-pub enum Symbol {
+enum Symbol {
     Matched,
     NotMatched,
 }
@@ -115,6 +115,20 @@ enum Direction {
     Parent,
     Sibling,
 }
+
+// Note: This StateInfo could be made much more compact:
+// State only needs 3 bits (7 values)
+// Direction only needs 1 bit, it could also be dropped and dynamically
+// calculated
+// The backtrack distance could fit on 8 bits, maybe less.
+// Compound selectors are generally simple and should rarely
+// reach 16 states or more.
+// The number of simple selectors is also generally low per state.
+// 8 bits should be more than enough to store the first index and the size.
+// Overall, if we wanted to, we could pack this safely on 32 bits. If our
+// assumptions are breached, we could probably fail to evaluate the rule
+// since its excessive complexity is most likely due to an error somewhere
+// or a maliciously generated rule.
 
 #[derive(PartialEq, Clone, Debug)]
 pub struct StateInfo {
@@ -245,6 +259,7 @@ fn get_states(selector: &CompoundSelector)
 
     selector_list.extend(selector.simple_selectors.iter().cloned());
 
+    // TODO: Remove our 2 artificial states
     state_list.push(StateInfo {
         state: State::Matched,
         direction: Direction::Parent,
@@ -277,11 +292,11 @@ pub fn to_string(nfa: &SelectorNFA) -> String {
     for info in nfa.state_list.iter() {
         let dist = info.backtrack_distance;
         match info.state {
-            State::Leaf => { result.push_str(&format!("$ ({})", dist)); }
-            State::Child => { result.push_str(&format!("> ({})", dist)); }
-            State::Descendant => { result.push_str(&format!("_ ({})", dist)); }
-            State::NextSibling => { result.push_str(&format!("+ ({})", dist)); }
-            State::LaterSibling => { result.push_str(&format!("~ ({})", dist)); }
+            State::Leaf => { result.push_str(&format!("$ ({}),", dist)); }
+            State::Child => { result.push_str(&format!("> ({}),", dist)); }
+            State::Descendant => { result.push_str(&format!("_ ({}),", dist)); }
+            State::NextSibling => { result.push_str(&format!("+ ({}),", dist)); }
+            State::LaterSibling => { result.push_str(&format!("~ ({}),", dist)); }
             _ => {}
         };
     }
@@ -373,10 +388,8 @@ pub fn build_nfa(selector: &CompoundSelector) -> SelectorNFA {
     };
 }
 
-fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
-                               parent_bf: Option<&BloomFilter>,
-                               hier_level: usize,
-                               last_tested_hier_level: &mut usize)
+fn is_rejected_by_bloom_filter(nfa: &SelectorNFA,
+                               parent_bf: Option<&BloomFilter>)
                                -> bool {
     // The parent bloom filter holds whether or not some properties
     // might have been supported by the parent nodes.
@@ -385,29 +398,14 @@ fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
     // necessarily the parent nodes. But, if a particular descendant state
     // does NOT match with the bloom filter, no parent node can match since
     // they would remove information but children nodes could match.
-    //
-    // Since we iterate on nodes towards the parent, as soon as a descendant
-    // state does not match, we can never match. Additionally, if our
-    // descendant state matches, it will also match for all current siblings
-    // since they share the same parent bloom filter. This means we only
-    // need to test the bloom filter if the current state matches AND we
-    // moved up in the hierarchy since the last test. Incidentally, if we
-    // backtrack, we can cache the result since it will never change.
 
     let bf = match parent_bf {
         None => return false,
         Some(ref bf) => bf,
     };
 
-    if hier_level <= *last_tested_hier_level {
-        // We already tested this level. If we had been rejected we would have
-        // terminated. We thus obviously still match.
-        return false;
-    }
-
-    for next_state_idx in (state_idx + 1) .. nfa.state_list.len() {
-        let ref info = nfa.state_list[next_state_idx];
-
+    // Start at index 3, skip our 2 artificial states and our leaf state
+    for info in &nfa.state_list[3 .. nfa.state_list.len()] {
         // TODO: See if we should test child states as well? Original impl
         // doesn't but is that correct?
 
@@ -444,18 +442,15 @@ fn is_rejected_by_bloom_filter(state_idx: usize, nfa: &SelectorNFA,
         }
     }
 
-    // Update our last tested level which also implies our last non-rejected
-    // level
-    *last_tested_hier_level = hier_level;
-
     return false;
 }
 
-#[inline(never)]
+#[inline]
 fn eval_selectors<E>(element: &E,
                      simple_selectors: &[SimpleSelector],
                      shareable: &mut bool, stats: &mut DebugStats)
                 -> Symbol where E: Element {
+
     let all_matched = simple_selectors.iter().all(|sel| {
         matching::matches_simple_selector(sel, element, shareable, stats)
     });
@@ -492,9 +487,7 @@ fn get_not_matched_backtrack_distance(state_idx: usize) -> usize {
 }
 
 fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
-                 mut hier_level: usize, last_tested_hier_level: &mut usize,
-                 element: &E,
-                 parent_bf: Option<&BloomFilter>,
+                 element: &E, parent_bf: Option<&BloomFilter>,
                  shareable: &mut bool, stats: &mut DebugStats)
                  -> usize where E: Element {
 
@@ -505,31 +498,31 @@ fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
     // Convert our input element into a symbol
     let symbol = get_symbol(&info, nfa, element, shareable, stats);
 
-    let next_state_idx = match symbol {
-        Symbol::Matched => {
-            if is_rejected_by_bloom_filter(state_idx, nfa, parent_bf,
-                                   hier_level, last_tested_hier_level) {
-                // If the bloom filter rejects our descendant selectors,
-                // we can never match
-                return get_not_matched_backtrack_distance(state_idx);
-            }
-            if state_idx + 1 >= nfa.state_list.len() {
-                // We fully matched
-                return get_matched_backtrack_distance(state_idx);
-            }
-            state_idx + 1
-        },
+    if symbol == Symbol::NotMatched {
         // Back track
-        Symbol::NotMatched => return info.backtrack_distance,
-    };
+        return info.backtrack_distance;
+    }
+
+    let next_state_idx = state_idx + 1;
+
+    if next_state_idx >= nfa.state_list.len() {
+        // We fully matched
+        return get_matched_backtrack_distance(state_idx);
+    }
+
+    if info.state == State::Leaf {
+        // Only test the bloom filter once, if our leaf state matches
+        if is_rejected_by_bloom_filter(nfa, parent_bf) {
+            // If the bloom filter rejects our descendant selectors,
+            // we can never match
+            return get_not_matched_backtrack_distance(state_idx);
+        }
+    }
 
     let ref next_info = nfa.state_list[next_state_idx];
 
     let mut next_element = match next_info.direction {
-        Direction::Parent => {
-            hier_level += 1;
-            element.parent_element()
-        },
+        Direction::Parent => element.parent_element(),
         Direction::Sibling => element.prev_sibling_element(),
     };
 
@@ -546,18 +539,13 @@ fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
 
         // Try our next state with the next element
         let distance = eval_state(next_state_idx, nfa,
-                                  hier_level,
-                                  last_tested_hier_level,
                                   &element, parent_bf,
                                   shareable, stats);
 
         if distance > 1 { return distance - 1; }
 
         next_element = match next_info.direction {
-            Direction::Parent => {
-                hier_level += 1;
-                element.parent_element()
-            },
+            Direction::Parent => element.parent_element(),
             Direction::Sibling => element.prev_sibling_element(),
         };
     }
@@ -569,20 +557,9 @@ pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
                       stats: &mut DebugStats)
                       -> bool where E: Element {
 
-    // TODO: Move the bloom filter test after our leaf test
-    // If our leaf matches and we should test the bloom filter (add flag),
-    // test it once. No point in testing it every time.
-    // This means we need to move out the leaf test separaretly.
-
     let leaf_state_idx = 2;    // Index 2 is leaf
 
-    // Start hierarchy level 1 above the last tested level to make
-    // sure we test the first level
-    let hier_level = 1;
-    let mut last_tested_hier_level = 0;
-
-    let distance = eval_state(leaf_state_idx, nfa, hier_level,
-                              &mut last_tested_hier_level,
+    let distance = eval_state(leaf_state_idx, nfa,
                               element, parent_bf, shareable, stats);
 
     // If we backtrack this far, it means we are backtracking towards one
