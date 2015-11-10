@@ -95,8 +95,6 @@ use bloom::BloomFilter;
 
 #[derive(Eq, PartialEq, Clone, Hash, Copy, Debug)]
 enum State {
-    Matched,
-    Failed,
     Leaf,
     Child,
     Descendant,
@@ -125,10 +123,19 @@ enum Direction {
 // reach 16 states or more.
 // The number of simple selectors is also generally low per state.
 // 8 bits should be more than enough to store the first index and the size.
+// We could also omit the start index since states are processed linearly we
+// could simply keep track of our current offset on the stack.
+//
 // Overall, if we wanted to, we could pack this safely on 32 bits. If our
 // assumptions are breached, we could probably fail to evaluate the rule
 // since its excessive complexity is most likely due to an error somewhere
 // or a maliciously generated rule.
+// This could also be used to store a fixed number of states in SelectorNFA
+// with an enum. A Vec is likely to be 12-24 bytes depending on the platform
+// which is enough to store 3-6 states which would likely fit most rules
+// and thus avoid an extra cache miss on those for the Vec indirection. We
+// could also make SelectorNFA fit inside a cache line and with 64 bytes,
+// it would likely be enough space to save a cache miss on 90%+ of rules.
 
 #[derive(PartialEq, Clone, Debug)]
 pub struct StateInfo {
@@ -162,9 +169,6 @@ enum BacktrackTarget {
 fn get_backtrack_distance(state: State,
                           state_list: &Vec<StateInfo>)
                           -> usize {
-    // We should always have at least our 2 artificial states
-    if state_list.len() <= 2 { panic!(); }
-
     // Backtracking works by going back up 1 level on the evaluation stack
     // When a state fails a match for a node, we need to backtrack to
     // try either a different node for the same state (or a previous state
@@ -174,9 +178,6 @@ fn get_backtrack_distance(state: State,
     // need to backtrack by 2+ to try a previous state on a new node.
 
     let mut target = match state {
-        // First two states are special artificial states
-        State::Matched |
-        State::Failed => panic!(),
         // If our leaf fails, we backtrack to the failed state
         State::Leaf => return 1,
         // If child fails, we backtrack looking for a previous descendant state
@@ -193,7 +194,7 @@ fn get_backtrack_distance(state: State,
     // We need to try a previous state, thus at least twice
     let mut distance = 2;
 
-    for info in state_list[2 .. state_list.len()].iter().rev() {
+    for info in state_list.iter().rev() {
         match (target, info.state) {
             // If we meet a child node, we upgrade our search to the closest
             // descendant
@@ -259,21 +260,6 @@ fn get_states(selector: &CompoundSelector)
 
     selector_list.extend(selector.simple_selectors.iter().cloned());
 
-    // TODO: Remove our 2 artificial states
-    state_list.push(StateInfo {
-        state: State::Matched,
-        direction: Direction::Parent,
-        backtrack_distance: !0,
-        first_selector_idx: !0,
-        num_selectors: !0,
-    });
-    state_list.push(StateInfo {
-        state: State::Failed,
-        direction: Direction::Parent,
-        backtrack_distance: !0,
-        first_selector_idx: !0,
-        num_selectors: !0,
-    });
     state_list.push(StateInfo {
         state: State::Leaf,
         direction: Direction::Parent,
@@ -297,7 +283,6 @@ pub fn to_string(nfa: &SelectorNFA) -> String {
             State::Descendant => { result.push_str(&format!("_ ({}),", dist)); }
             State::NextSibling => { result.push_str(&format!("+ ({}),", dist)); }
             State::LaterSibling => { result.push_str(&format!("~ ({}),", dist)); }
-            _ => {}
         };
     }
     return result;
@@ -404,8 +389,7 @@ fn is_rejected_by_bloom_filter(nfa: &SelectorNFA,
         Some(ref bf) => bf,
     };
 
-    // Start at index 3, skip our 2 artificial states and our leaf state
-    for info in &nfa.state_list[3 .. nfa.state_list.len()] {
+    for info in nfa.state_list.iter() {
         // TODO: See if we should test child states as well? Original impl
         // doesn't but is that correct?
 
@@ -476,14 +460,16 @@ fn get_symbol<E>(info: &StateInfo, nfa: &SelectorNFA, element: &E,
 
 #[inline]
 fn get_matched_backtrack_distance(state_idx: usize) -> usize {
-    // Matched is index 0
-    return state_idx - 0;
+    // When matched, we backtrack such that when we reach the root,
+    // the remaining backtrack distance is 2
+    return state_idx + 2;
 }
 
 #[inline]
 fn get_not_matched_backtrack_distance(state_idx: usize) -> usize {
-    // Failed is index 1
-    return state_idx - 1;
+    // When matched, we backtrack such that when we reach the root,
+    // the remaining backtrack distance is 1
+    return state_idx + 1;
 }
 
 fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
@@ -512,6 +498,15 @@ fn eval_state<E>(state_idx: usize, nfa: &SelectorNFA,
 
     if info.state == State::Leaf {
         // Only test the bloom filter once, if our leaf state matches
+
+        // TODO: We could store a flag in the StateInfo of the leaf
+        // or SelectorNFA on whether or not we need to test the bloom filter.
+        // It would avoid a function call here for most rules that match.
+
+        // TODO: We could also extract the leaf state evaluation and remove
+        // the branch entirely from non-leaf state evaluation although the
+        // branch is likely to be properly predicted anyway
+
         if is_rejected_by_bloom_filter(nfa, parent_bf) {
             // If the bloom filter rejects our descendant selectors,
             // we can never match
@@ -557,9 +552,7 @@ pub fn matches_nfa<E>(nfa: &SelectorNFA, element: &E,
                       stats: &mut DebugStats)
                       -> bool where E: Element {
 
-    let leaf_state_idx = 2;    // Index 2 is leaf
-
-    let distance = eval_state(leaf_state_idx, nfa,
+    let distance = eval_state(0, nfa,
                               element, parent_bf, shareable, stats);
 
     // If we backtrack this far, it means we are backtracking towards one
